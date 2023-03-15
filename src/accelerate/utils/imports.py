@@ -76,7 +76,7 @@ def is_deepspeed_available():
     # AND checking it has an author field in the metadata that is HuggingFace.
     if package_exists:
         try:
-            _ = importlib_metadata.metadata("deepspeed")
+            _ = importlib_metadata.metadata("cndsp")
             return True
         except importlib_metadata.PackageNotFoundError:
             return False
@@ -87,8 +87,8 @@ def is_bf16_available(ignore_tpu=False):
     if is_tpu_available():
         return not ignore_tpu
     if is_torch_version(">=", "1.10"):
-        if torch.cuda.is_available():
-            return torch.cuda.is_bf16_supported()
+        if torch.mlu.is_available():
+            return torch.mlu.is_bf16_supported()
         return True
     return False
 

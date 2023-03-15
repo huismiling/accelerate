@@ -42,7 +42,7 @@ def env_command_parser(subparsers=None):
 
 def env_command(args):
     pt_version = torch.__version__
-    pt_cuda_available = torch.cuda.is_available()
+    pt_mlu_available = torch.mlu.is_available()
 
     accelerate_config = "Not found"
     # Get the default from the config file.
@@ -54,7 +54,7 @@ def env_command(args):
         "Platform": platform.platform(),
         "Python version": platform.python_version(),
         "Numpy version": np.__version__,
-        "PyTorch version (GPU?)": f"{pt_version} ({pt_cuda_available})",
+        "PyTorch version (GPU?)": f"{pt_version} ({pt_mlu_available})",
     }
 
     print("\nCopy-and-paste the text below in your GitHub issue\n")

@@ -85,8 +85,8 @@ def init_on_device(device: torch.device, include_buffers: bool = False):
     import torch.nn as nn
     from accelerate import init_on_device
 
-    with init_on_device(device=torch.device("cuda")):
-        tst = nn.Liner(100, 100)  # on `cuda` device
+    with init_on_device(device=torch.device("mlu")):
+        tst = nn.Liner(100, 100)  # on `mlu` device
     ```
     """
     old_register_parameter = nn.Module.register_parameter

@@ -24,6 +24,7 @@ from functools import wraps
 from typing import Callable, List, Optional, Union
 
 import torch
+import torch_mlu
 import torch.utils.hooks as hooks
 
 from .checkpointing import load_accelerator_state, load_custom_state, save_accelerator_state, save_custom_state
@@ -148,7 +149,7 @@ class Accelerator:
             dataloaders. Should be one or several of:
 
             - `"torch"`: the base torch random number generator
-            - `"cuda"`: the CUDA random number generator (GPU only)
+            - `"mlu"`: the mlu random number generator (GPU only)
             - `"xla"`: the XLA random number generator (TPU only)
             - `"generator"`: the `torch.Generator` of the sampler (or batch sampler if there is no sampler in your
               dataloader) or of the iterable dataset (if it exists) if the underlying dataset is of that type.
@@ -257,7 +258,7 @@ class Accelerator:
         if deepspeed_plugin:
             if not is_deepspeed_available():
                 raise ImportError("DeepSpeed is not installed => run `pip install deepspeed` or build it from source.")
-            if compare_versions("deepspeed", "<", "0.6.5"):
+            if compare_versions("cndsp", "<", "0.6.5"):
                 raise ImportError("DeepSpeed version must be >= 0.6.5. Please update DeepSpeed.")
 
             mixed_precision = (
@@ -371,7 +372,7 @@ class Accelerator:
             and self.distributed_type not in (DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM)
         ):
             self.native_amp = True
-            if not torch.cuda.is_available() and not parse_flag_from_env("ACCELERATE_USE_MPS_DEVICE"):
+            if not torch.mlu.is_available() and not parse_flag_from_env("ACCELERATE_USE_MPS_DEVICE"):
                 raise ValueError(err.format(mode="fp16", requirement="a GPU"))
             kwargs = self.scaler_handler.to_kwargs() if self.scaler_handler is not None else {}
             if self.distributed_type == DistributedType.FSDP:
@@ -379,7 +380,7 @@ class Accelerator:
 
                 self.scaler = ShardedGradScaler(**kwargs)
             else:
-                self.scaler = torch.cuda.amp.GradScaler(**kwargs)
+                self.scaler = torch.mlu.amp.GradScaler(**kwargs)
         elif self.state.mixed_precision == "bf16" and self.distributed_type not in (
             DistributedType.DEEPSPEED,
             DistributedType.FSDP,
@@ -393,9 +394,9 @@ class Accelerator:
                 raise ValueError(err.format(mode="bf16", requirement="PyTorch >= 1.10 and a supported device."))
 
             # Only on the GPU do we care about scaling the gradients
-            if torch.cuda.is_available() and self.device.type != "cpu":
+            if torch.mlu.is_available() and self.device.type != "cpu":
                 kwargs = self.scaler_handler.to_kwargs() if self.scaler_handler is not None else {}
-                self.scaler = torch.cuda.amp.GradScaler(**kwargs)
+                self.scaler = torch.mlu.amp.GradScaler(**kwargs)
 
         # Start of internal step tracking
         self.step = 0
@@ -1026,12 +1027,12 @@ class Accelerator:
             model = torch.nn.parallel.DistributedDataParallel(model, **kwargs)
         if self.native_amp:
             model._original_forward = model.forward
-            if self.mixed_precision == "fp16" and is_torch_version(">=", "1.10"):
-                model.forward = torch.cuda.amp.autocast(dtype=torch.float16)(model.forward)
+            if self.mixed_precision == "fp16" and is_torch_version(">=", "1.9"):
+                model.forward = torch.mlu.amp.autocast(dtype=torch.float16)(model.forward)
             elif self.mixed_precision == "bf16" and self.distributed_type != DistributedType.TPU:
                 model.forward = torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)(model.forward)
             else:
-                model.forward = torch.cuda.amp.autocast()(model.forward)
+                model.forward = torch.mlu.amp.autocast()(model.forward)
             model.forward = convert_outputs_to_fp32(model.forward)
         if self.distributed_type == DistributedType.TPU and self.state.fork_launched:
             model = xmp.MpModelWrapper(model).to(self.device)
@@ -2329,13 +2330,13 @@ class Accelerator:
         ```
         """
         if self.native_amp:
-            if self.mixed_precision == "fp16" and is_torch_version(">=", "1.10"):
-                autocast_context = torch.cuda.amp.autocast(dtype=torch.float16)
+            if self.mixed_precision == "fp16" and is_torch_version(">=", "1.9"):
+                autocast_context = torch.mlu.amp.autocast(dtype=torch.float16)
             elif self.mixed_precision == "bf16":
                 if self.distributed_type in [DistributedType.NO, DistributedType.MULTI_CPU, DistributedType.MULTI_GPU]:
                     autocast_context = torch.autocast(dtype=torch.bfloat16, device_type=self.device.type)
             else:
-                autocast_context = torch.cuda.amp.autocast()
+                autocast_context = torch.mlu.amp.autocast()
 
             autocast_context.__enter__()
             yield

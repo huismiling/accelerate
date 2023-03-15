@@ -520,7 +520,7 @@ def simple_launcher(args):
     if args.mps:
         current_env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
     elif args.gpu_ids != "all" and args.gpu_ids is not None:
-        current_env["CUDA_VISIBLE_DEVICES"] = args.gpu_ids
+        current_env["MLU_VISIBLE_DEVICES"] = args.gpu_ids
     if args.num_machines > 1:
         current_env["MASTER_ADDR"] = args.main_process_ip
         current_env["MASTER_PORT"] = str(args.main_process_port)
@@ -555,7 +555,7 @@ def simple_launcher(args):
 
 
 def multi_gpu_launcher(args):
-    if is_torch_version(">=", "1.9.1"):
+    if is_torch_version(">=", "1.9.0"):
         import torch.distributed.run as distrib_run
     else:
         raise NotImplementedError("Native multi-GPU training requires pytorch>=1.9.1")
@@ -587,7 +587,7 @@ def multi_gpu_launcher(args):
     current_env = os.environ.copy()
     gpu_ids = getattr(args, "gpu_ids", "all")
     if gpu_ids != "all" and args.gpu_ids is not None:
-        current_env["CUDA_VISIBLE_DEVICES"] = gpu_ids
+        current_env["MLU_VISIBLE_DEVICES"] = gpu_ids
     mixed_precision = args.mixed_precision.lower()
     try:
         mixed_precision = PrecisionType(mixed_precision)
@@ -646,7 +646,7 @@ def multi_gpu_launcher(args):
 
 
 def deepspeed_launcher(args):
-    if is_torch_version(">=", "1.9.1"):
+    if is_torch_version(">=", "1.9.0"):
         import torch.distributed.run as distrib_run
     if not is_deepspeed_available():
         raise ImportError("DeepSpeed is not installed => run `pip3 install deepspeed` or build it from source.")
@@ -712,7 +712,7 @@ def deepspeed_launcher(args):
     current_env = os.environ.copy()
     gpu_ids = getattr(args, "gpu_ids", "all")
     if gpu_ids != "all" and args.gpu_ids is not None:
-        current_env["CUDA_VISIBLE_DEVICES"] = gpu_ids
+        current_env["MLU_VISIBLE_DEVICES"] = gpu_ids
     try:
         mixed_precision = PrecisionType(args.mixed_precision.lower())
     except ValueError:
@@ -756,7 +756,7 @@ def deepspeed_launcher(args):
             else:
                 sys.exit(1)
     else:
-        if is_torch_version("<", "1.9.1"):
+        if is_torch_version("<", "1.9.0"):
             raise NotImplementedError("Multi-node training requires pytorch>=1.9.1")
 
         debug = getattr(args, "debug", False)
@@ -1038,7 +1038,7 @@ def launch_command(args):
             args.dynamo_backend = "no"
     else:
         if args.num_processes is None:
-            args.num_processes = torch.cuda.device_count() if args.multi_gpu else 1
+            args.num_processes = torch.mlu.device_count() if args.multi_gpu else 1
             warned.append(f"\t`--num_processes` was set to a value of `{args.num_processes}`")
         if args.num_machines is None:
             warned.append("\t`--num_machines` was set to a value of `1`")

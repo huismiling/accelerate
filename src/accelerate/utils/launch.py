@@ -39,9 +39,19 @@ def _filter_args(args):
     """
     Filters out all `accelerate` specific args
     """
-    if is_torch_version(">=", "1.9.1"):
+    if is_torch_version(">=", "1.9.0"):
         import torch.distributed.run as distrib_run
     distrib_args = distrib_run.get_args_parser()
+
+    # fix torch==1.9.0
+    distrib_args.add_argument(
+        "--use_env",
+        default=True,
+        action="store_true",
+        help="Use environment variable to pass local rank. If set to True (default), the script "
+        "will NOT pass --local_rank as argument, and will instead set LOCAL_RANK.",
+    )
+
     new_args, _ = distrib_args.parse_known_args()
 
     for key, value in vars(args).items():

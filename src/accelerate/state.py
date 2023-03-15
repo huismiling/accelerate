@@ -113,8 +113,8 @@ class AcceleratorState:
                     self.process_index = torch.distributed.get_rank()
                     self.local_process_index = int(os.environ.get("LOCAL_RANK", -1))
                     if self.device is None:
-                        self.device = torch.device("cuda", self.local_process_index)
-                    torch.cuda.set_device(self.device)
+                        self.device = torch.device("mlu", self.local_process_index)
+                    torch.mlu.set_device(self.device)
                     self._mixed_precision = mixed_precision
             elif is_tpu_available() and not cpu:
                 self.distributed_type = DistributedType.TPU
@@ -140,33 +140,33 @@ class AcceleratorState:
                 if not torch.distributed.is_initialized():
                     from .utils import compare_versions
 
-                    self.backend = "nccl"
-                    if compare_versions("deepspeed", ">", "0.6.5"):
+                    self.backend = "cncl"
+                    if compare_versions("cndsp", ">", "0.6.5"):
                         from deepspeed import comm as dist
 
                         dist.init_distributed(dist_backend=self.backend)
                     else:
-                        torch.distributed.init_process_group(backend="nccl", **kwargs)
+                        torch.distributed.init_process_group(backend="cncl", **kwargs)
 
                 self.num_processes = torch.distributed.get_world_size()
                 self.process_index = torch.distributed.get_rank()
                 self.local_process_index = int(os.environ.get("LOCAL_RANK", -1))
                 if self.device is None:
-                    self.device = torch.device("cuda", self.local_process_index)
-                torch.cuda.set_device(self.device)
+                    self.device = torch.device("mlu", self.local_process_index)
+                torch.mlu.set_device(self.device)
                 self._mixed_precision = "no"  # deepspeed handles mixed_precision using deepspeed_config
                 self.deepspeed_plugin = deepspeed_plugin
             elif int(os.environ.get("LOCAL_RANK", -1)) != -1 and not cpu:
                 self.distributed_type = DistributedType.MULTI_GPU
                 if not torch.distributed.is_initialized():
-                    torch.distributed.init_process_group(backend="nccl", **kwargs)
-                    self.backend = "nccl"
+                    torch.distributed.init_process_group(backend="cncl", **kwargs)
+                    self.backend = "cncl"
                 self.num_processes = torch.distributed.get_world_size()
                 self.process_index = torch.distributed.get_rank()
                 self.local_process_index = int(os.environ.get("LOCAL_RANK", -1))
                 if self.device is None:
-                    self.device = torch.device("cuda", self.local_process_index)
-                torch.cuda.set_device(self.device)
+                    self.device = torch.device("mlu", self.local_process_index)
+                torch.mlu.set_device(self.device)
                 self._mixed_precision = mixed_precision
                 if os.environ.get("ACCELERATE_USE_FSDP", "false") == "true":
                     self.distributed_type = DistributedType.FSDP
@@ -249,18 +249,18 @@ class AcceleratorState:
                         if self.device is None:
                             self.device = torch.device("mps")
                 elif self.device is None:
-                    if cpu or not torch.cuda.is_available():
+                    if cpu or not torch.mlu.is_available():
                         self.device = torch.device("cpu")
                     else:
-                        self.device = torch.device("cuda")
+                        self.device = torch.device("mlu")
                 self._mixed_precision = mixed_precision
 
             if (
                 self.dynamo_backend != DynamoBackend.NO
                 and self._mixed_precision == "no"
-                and self.device.type == "cuda"
+                and self.device.type == "mlu"
             ):
-                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.mlu.matmul.allow_tf32 = True
 
         self.fork_launched = parse_flag_from_env("FORK_LAUNCHED", 0)
 

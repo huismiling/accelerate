@@ -43,8 +43,8 @@ def set_seed(seed: int, device_specific: bool = False):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    # ^^ safe to call this function even if cuda is not available
+    torch.mlu.manual_seed_all(seed)
+    # ^^ safe to call this function even if mlu is not available
     if is_tpu_available():
         xm.set_rng_state(seed)
 
@@ -58,6 +58,8 @@ def synchronize_rng_state(rng_type: Optional[RNGType] = None, generator: Optiona
     elif rng_type == RNGType.XLA:
         assert is_tpu_available(), "Can't synchronize XLA seeds on an environment without TPUs."
         rng_state = torch.tensor(xm.get_rng_state())
+    elif rng_type == RNGType.MLU:
+        rng_state = torch.mlu.get_rng_state()
     elif rng_type == RNGType.GENERATOR:
         assert generator is not None, "Need a generator to synchronize its seed."
         rng_state = generator.get_state()
@@ -78,6 +80,8 @@ def synchronize_rng_state(rng_type: Optional[RNGType] = None, generator: Optiona
         torch.set_rng_state(rng_state)
     elif rng_type == RNGType.CUDA:
         torch.cuda.set_rng_state(rng_state)
+    elif rng_type == RNGType.MLU:
+        torch.mlu.set_rng_state(rng_state)
     elif rng_type == RNGType.XLA:
         xm.set_rng_state(rng_state.item())
     elif rng_type == RNGType.GENERATOR:

@@ -53,8 +53,8 @@ def write_basic_config(mixed_precision="no", save_location: str = default_json_c
         "mixed_precision": mixed_precision,
         "dynamo_backend": dynamo_backend,
     }
-    if torch.cuda.is_available():
-        num_gpus = torch.cuda.device_count()
+    if torch.mlu.is_available():
+        num_gpus = torch.mlu.device_count()
         config["num_processes"] = num_gpus
         config["use_cpu"] = False
         if num_gpus > 1:

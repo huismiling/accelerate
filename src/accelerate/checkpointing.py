@@ -19,7 +19,7 @@ from typing import List
 
 import numpy as np
 import torch
-from torch.cuda.amp import GradScaler
+from torch.mlu.amp import GradScaler
 
 from .utils import (
     MODEL_NAME,
@@ -64,7 +64,7 @@ def save_accelerator_state(
             A list of learning rate schedulers
         process_index (`int`):
             The current process index in the Accelerator state
-        scaler (`torch.cuda.amp.GradScaler`, *optional*):
+        scaler (`torch.mlu.amp.GradScaler`, *optional*):
             An optional gradient scaler instance to save
     """
     # Model states
@@ -99,8 +99,8 @@ def save_accelerator_state(
     states["random_state"] = random.getstate()
     states["numpy_random_seed"] = np.random.get_state()
     states["torch_manual_seed"] = torch.get_rng_state()
-    states["torch_cuda_manual_seed"] = torch.cuda.get_rng_state_all()
-    # ^^ safe to call this function even if cuda is not available
+    states["torch_mlu_manual_seed"] = torch.mlu.get_rng_state_all()
+    # ^^ safe to call this function even if mlu is not available
     if is_tpu_available():
         states["xm_seed"] = xm.get_rng_state()
     output_states_file = os.path.join(output_dir, states_name)
@@ -126,7 +126,7 @@ def load_accelerator_state(
             A list of learning rate schedulers
         process_index (`int`):
             The current process index in the Accelerator state
-        scaler (`torch.cuda.amp.GradScaler`, *optional*):
+        scaler (`torch.mlu.amp.GradScaler`, *optional*):
             An optional *GradScaler* instance to load
         load_model_func_kwargs (`dict`, *optional*):
             Additional arguments that can be passed to the model's `load_state_dict` method.
@@ -164,8 +164,8 @@ def load_accelerator_state(
         random.setstate(states["random_state"])
         np.random.set_state(states["numpy_random_seed"])
         torch.set_rng_state(states["torch_manual_seed"])
-        torch.cuda.set_rng_state_all(states["torch_cuda_manual_seed"])
-        # ^^ safe to call this function even if cuda is not available
+        torch.mlu.set_rng_state_all(states["torch_mlu_manual_seed"])
+        # ^^ safe to call this function even if mlu is not available
         if is_tpu_available():
             xm.set_rng_state(states["xm_seed"])
         logger.info("All random states loaded successfully")
