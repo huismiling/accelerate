@@ -19,10 +19,13 @@ import os
 import platform
 
 import numpy as np
+import psutil
 import torch
 
 from accelerate import __version__ as version
 from accelerate.commands.config import default_config_file, load_config_from_file
+
+from ..utils import is_xpu_available
 
 
 def env_command_parser(subparsers=None):
@@ -43,6 +46,8 @@ def env_command_parser(subparsers=None):
 def env_command(args):
     pt_version = torch.__version__
     pt_mlu_available = torch.mlu.is_available()
+    pt_cuda_available = torch.cuda.is_available()
+    pt_xpu_available = is_xpu_available()
 
     accelerate_config = "Not found"
     # Get the default from the config file.
@@ -54,8 +59,15 @@ def env_command(args):
         "Platform": platform.platform(),
         "Python version": platform.python_version(),
         "Numpy version": np.__version__,
-        "PyTorch version (GPU?)": f"{pt_version} ({pt_mlu_available})",
+        "PyTorch version (MLU?)": f"{pt_version} ({pt_mlu_available})",
+        "PyTorch version (GPU?)": f"{pt_version} ({pt_cuda_available})",
+        "PyTorch XPU available": str(pt_xpu_available),
+        "System RAM": f"{psutil.virtual_memory().total / 1024 ** 3:.2f} GB",
     }
+    if pt_cuda_available:
+        info["GPU type"] = torch.cuda.get_device_name()
+    if pt_mlu_available:
+        info["MLU type"] = torch.mlu.get_device_name()
 
     print("\nCopy-and-paste the text below in your GitHub issue\n")
     print("\n".join([f"- {prop}: {val}" for prop, val in info.items()]))

@@ -8,12 +8,15 @@ on:
 env:
   RUN_SLOW: "yes"
   IS_GITHUB_CI: "1"
+  SLACK_API_TOKEN: ${{ secrets.SLACK_API_TOKEN }}
+
 
 jobs:
   run_all_tests_single_gpu:
     runs-on: [self-hosted, docker-gpu, multi-gpu]
     env:
       CUDA_VISIBLE_DEVICES: "0"
+      TEST_TYPE: "single_gpu"
     container:
       image: huggingface/accelerate-gpu:latest
       options: --gpus all --shm-size "16gb"
@@ -28,12 +31,13 @@ jobs:
           git config --global --add safe.directory '*'
           git fetch && git checkout ${{ github.sha }} 
           pip install -e . --no-deps
-          pip install pytest-reportlog
+          pip install pytest-reportlog tabulate
 
       - name: Run test on GPUs
         run: |
           source activate accelerate
           make test
+          
       - name: Run examples on GPUs
         run: |
           source activate accelerate
@@ -43,12 +47,14 @@ jobs:
       - name: Generate Report
         if: always()
         run: |
+          pip install slack_sdk tabulate
           python utils/log_reports.py >> $GITHUB_STEP_SUMMARY
 
   run_all_tests_multi_gpu:
     runs-on: [self-hosted, docker-gpu, multi-gpu]
     env:
       CUDA_VISIBLE_DEVICES: "0,1"
+      TEST_TYPE: "multi_gpu"
     container:
       image: huggingface/accelerate-gpu:latest
       options: --gpus all --shm-size "16gb"
@@ -63,13 +69,13 @@ jobs:
           git config --global --add safe.directory '*'
           git fetch && git checkout ${{ github.sha }}
           pip install -e . --no-deps
-          pip install pytest-reportlog
+          pip install pytest-reportlog tabulate
 
       - name: Run core and big modeling tests on GPUs
         run: |
           source activate accelerate
-          make test_big_modeling
           make test_core
+          make test_big_modeling
 
       - name: Run Integration tests on GPUs
         run: |
@@ -85,4 +91,5 @@ jobs:
       - name: Generate Report
         if: always()
         run: |
+          pip install slack_sdk tabulate
           python utils/log_reports.py >> $GITHUB_STEP_SUMMARY

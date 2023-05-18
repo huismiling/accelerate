@@ -72,7 +72,7 @@ First the code shown earlier will be converted to utilize 🤗 Accelerate withou
 
 <Tip warning={true}>
 
-  In its current state, this code is not going to perform gradient accumulation efficiently due to a process called gradient synchronization. Read more about that in the [Concepts tutorial](concept_guides/gradient_synchronization)!
+  In its current state, this code is not going to perform gradient accumulation efficiently due to a process called gradient synchronization. Read more about that in the [Concepts tutorial](../concept_guides/gradient_synchronization)!
 
 </Tip>
 
@@ -111,6 +111,13 @@ You can remove all the special checks for the step number and the loss adjustmen
 
 As you can see the [`Accelerator`] is able to keep track of the batch number you are on and it will automatically know whether to step through the prepared optimizer and how to adjust the loss. 
 
+<Tip>
+
+Typically with gradient accumulation, you would need to adjust the number of steps to reflect the change in total batches you are 
+training on. 🤗 Accelerate will automatically do this for you, so long as you pass `adjust_scheduler_to_accumulation` to the [`Accelerator`] object's `__init__`.
+
+</Tip>
+
 ## The finished code
 
 Below is the finished implementation for performing gradient accumulation with 🤗 Accelerate
@@ -127,4 +134,4 @@ for batch in training_dataloader:
         optimizer.zero_grad()
 ```
 
-To learn more about what magic this wraps around, read the [Gradient Synchronization concept guide](/concept_guides/gradient_synchronization)
+To learn more about what magic this wraps around, read the [Gradient Synchronization concept guide](../concept_guides/gradient_synchronization)

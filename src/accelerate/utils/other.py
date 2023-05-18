@@ -18,9 +18,11 @@ from contextlib import contextmanager
 import torch
 
 from ..commands.config.default import write_basic_config  # noqa: F401
-from ..state import AcceleratorState
+from ..state import PartialState
 from .dataclasses import DistributedType
 from .imports import is_deepspeed_available, is_tpu_available
+from .transformer_engine import convert_model
+from .versions import is_torch_version
 
 
 if is_deepspeed_available():
@@ -28,6 +30,15 @@ if is_deepspeed_available():
 
 if is_tpu_available(check_device=False):
     import torch_xla.core.xla_model as xm
+
+
+def is_compiled_module(module):
+    """
+    Check whether the module was compiled with torch.compile()
+    """
+    if is_torch_version("<", "2.0.0") or not hasattr(torch, "_dynamo"):
+        return False
+    return isinstance(module, torch._dynamo.eval_frame.OptimizedModule)
 
 
 def extract_model_from_parallel(model, keep_fp32_wrapper: bool = True):
@@ -44,6 +55,12 @@ def extract_model_from_parallel(model, keep_fp32_wrapper: bool = True):
         `torch.nn.Module`: The extracted model.
     """
     options = (torch.nn.parallel.DistributedDataParallel, torch.nn.DataParallel)
+
+    is_compiled = is_compiled_module(model)
+    if is_compiled:
+        compiled_model = model
+        model = model._orig_mod
+
     if is_deepspeed_available():
         options += (DeepSpeedEngine,)
 
@@ -59,6 +76,13 @@ def extract_model_from_parallel(model, keep_fp32_wrapper: bool = True):
                 if forward == original_forward:
                     break
             model.forward = forward
+        if getattr(model, "_converted_to_transformer_engine", False):
+            convert_model(model, to_transformer_engine=False)
+
+    if is_compiled:
+        compiled_model._orig_mod = model
+        model = compiled_model
+
     return model
 
 
@@ -72,15 +96,7 @@ def wait_for_everyone():
 
     </Tip>
     """
-    if (
-        AcceleratorState().distributed_type == DistributedType.MULTI_GPU
-        or AcceleratorState().distributed_type == DistributedType.MULTI_CPU
-        or AcceleratorState().distributed_type == DistributedType.DEEPSPEED
-        or AcceleratorState().distributed_type == DistributedType.FSDP
-    ):
-        torch.distributed.barrier()
-    elif AcceleratorState().distributed_type == DistributedType.TPU:
-        xm.rendezvous("accelerate.utils.wait_for_everyone")
+    PartialState().wait_for_everyone()
 
 
 def save(obj, f):
@@ -91,9 +107,9 @@ def save(obj, f):
         obj: The data to save
         f: The file (or file-like object) to use to save the data
     """
-    if AcceleratorState().distributed_type == DistributedType.TPU:
+    if PartialState().distributed_type == DistributedType.TPU:
         xm.save(obj, f)
-    elif AcceleratorState().local_process_index == 0:
+    elif PartialState().local_process_index == 0:
         torch.save(obj, f)
 
 
@@ -121,7 +137,8 @@ def patch_environment(**kwargs):
     yield
 
     for key in kwargs:
-        del os.environ[key.upper()]
+        if key.upper() in os.environ:
+            del os.environ[key.upper()]
 
 
 def get_pretty_name(obj):
@@ -135,3 +152,21 @@ def get_pretty_name(obj):
     if hasattr(obj, "__name__"):
         return obj.__name__
     return str(obj)
+
+
+def merge_dicts(source, destination):
+    """
+    Recursively merges two dictionaries.
+
+    Args:
+        source (`dict`): The dictionary to merge into `destination`.
+        destination (`dict`): The dictionary to merge `source` into.
+    """
+    for key, value in source.items():
+        if isinstance(value, dict):
+            node = destination.setdefault(key, {})
+            merge_dicts(value, node)
+        else:
+            destination[key] = value
+
+    return destination
