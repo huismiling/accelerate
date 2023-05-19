@@ -98,7 +98,15 @@ def is_tpu_available(check_device=True):
 
 
 def is_deepspeed_available():
-    return _is_package_available("cndsp")
+    package_exists = importlib.util.find_spec("deepspeed") is not None
+    # Check we're not importing a "deepspeed" directory somewhere but the actual library by trying to grab the version
+    # AND checking it has an author field in the metadata that is HuggingFace.
+    if package_exists:
+        try:
+            _ = importlib_metadata.metadata("cndsp")
+            return True
+        except importlib_metadata.PackageNotFoundError:
+            return False
 
 
 def is_bf16_available(ignore_tpu=False):

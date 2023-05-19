@@ -1484,9 +1484,10 @@ class Accelerator:
                 if isinstance(optimizer, (DummyOptim)):
                     kwargs["model_parameters"] = optimizer.params
                 else:
+                    # cndsp 0.7.1 not support cuda kernel
                     if self.deepspeed_config["zero_optimization"].get("offload_optimizer", {}).get(
                         "device", "none"
-                    ) != "none" and self.deepspeed_config.get("zero_force_ds_cpu_optimizer", True):
+                    ) != "none" and self.deepspeed_config.get("zero_force_ds_cpu_optimizer", False):
                         from deepspeed.ops.adam import DeepSpeedCPUAdam
 
                         defaults = {k: v for k, v in optimizer.defaults.items() if k in ["lr", "weight_decay"]}
