@@ -606,7 +606,7 @@ def simple_launcher(args):
 
 
 def multi_gpu_launcher(args):
-    if is_torch_version(">=", "1.9.1"):
+    if is_torch_version(">=", "1.9.0"):
         import torch.distributed.run as distrib_run
     else:
         raise NotImplementedError(
@@ -635,7 +635,7 @@ def multi_gpu_launcher(args):
 
 
 def deepspeed_launcher(args):
-    if is_torch_version(">=", "1.9.1"):
+    if is_torch_version(">=", "1.9.0"):
         import torch.distributed.run as distrib_run
     if not is_deepspeed_available():
         raise ImportError("DeepSpeed is not installed => run `pip3 install deepspeed` or build it from source.")
@@ -657,7 +657,7 @@ def deepspeed_launcher(args):
             else:
                 sys.exit(1)
     else:
-        if is_torch_version("<", "1.9.1"):
+        if is_torch_version("<", "1.9.0"):
             raise NotImplementedError("Multi-node training requires pytorch>=1.9.1")
 
         debug = getattr(args, "debug", False)
@@ -868,9 +868,9 @@ def _validate_launch_command(args):
             args.dynamo_backend = "no"
     else:
         if args.num_processes is None:
-            args.num_processes = torch.cuda.device_count()
+            args.num_processes = torch.mlu.device_count()
             warned.append(f"\t`--num_processes` was set to a value of `{args.num_processes}`")
-        if torch.cuda.device_count() > 1 and not args.multi_gpu:
+        if torch.mlu.device_count() > 1 and not args.multi_gpu:
             warned.append(
                 "\t\tMore than one GPU was found, enabling multi-GPU training.\n"
                 "\t\tIf this was unintended please pass in `--num_processes=1`."

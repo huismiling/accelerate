@@ -28,7 +28,7 @@ from .imports import is_xpu_available
 
 def release_memory(*objects):
     """
-    Releases memory from `objects` by setting them to `None` and calls `gc.collect()` and `torch.cuda.empty_cache()`.
+    Releases memory from `objects` by setting them to `None` and calls `gc.collect()` and `torch.mlu.empty_cache()`.
     Returned objects should be reassigned to the same variables.
 
     Args:
@@ -43,8 +43,8 @@ def release_memory(*objects):
         >>> import torch
         >>> from accelerate.utils import release_memory
 
-        >>> a = torch.ones(1000, 1000).cuda()
-        >>> b = torch.ones(1000, 1000).cuda()
+        >>> a = torch.ones(1000, 1000).mlu()
+        >>> b = torch.ones(1000, 1000).mlu()
         >>> a, b = release_memory(a, b)
         ```
     """
@@ -54,7 +54,7 @@ def release_memory(*objects):
         objects[i] = None
     gc.collect()
     if not is_xpu_available():
-        torch.cuda.empty_cache()
+        torch.mlu.empty_cache()
     else:
         torch.xpu.empty_cache()
     return objects
@@ -62,14 +62,14 @@ def release_memory(*objects):
 
 def should_reduce_batch_size(exception: Exception) -> bool:
     """
-    Checks if `exception` relates to CUDA out-of-memory, CUDNN not supported, or CPU out-of-memory
+    Checks if `exception` relates to mlu out-of-memory, CUDNN not supported, or CPU out-of-memory
 
     Args:
         exception (`Exception`):
             An exception
     """
     _statements = [
-        "CUDA out of memory.",  # CUDA OOM
+        "mlu out of memory.",  # mlu OOM
         "cuDNN error: CUDNN_STATUS_NOT_SUPPORTED.",  # CUDNN SNAFU
         "DefaultCPUAllocator: can't allocate memory",  # CPU OOM
     ]
@@ -114,7 +114,7 @@ def find_executable_batch_size(function: callable = None, starting_batch_size: i
         nonlocal batch_size
         gc.collect()
         if not is_xpu_available():
-            torch.cuda.empty_cache()
+            torch.mlu.empty_cache()
         else:
             torch.xpu.empty_cache()
         params = list(inspect.signature(function).parameters.keys())
@@ -134,7 +134,7 @@ def find_executable_batch_size(function: callable = None, starting_batch_size: i
                 if should_reduce_batch_size(e):
                     gc.collect()
                     if not is_xpu_available():
-                        torch.cuda.empty_cache()
+                        torch.mlu.empty_cache()
                     else:
                         torch.xpu.empty_cache()
                     batch_size //= 2

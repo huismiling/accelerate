@@ -143,8 +143,8 @@ class PartialState:
                     self.process_index = torch.distributed.get_rank()
                     self.local_process_index = int(os.environ.get("LOCAL_RANK", -1))
                     if self.device is None:
-                        self.device = torch.device("cuda", self.local_process_index)
-                    torch.cuda.set_device(self.device)
+                        self.device = torch.device("mlu", self.local_process_index)
+                    torch.mlu.set_device(self.device)
             elif is_tpu_available() and not cpu:
                 self.distributed_type = DistributedType.TPU
                 self.num_processes = xm.xrt_world_size()
@@ -165,7 +165,7 @@ class PartialState:
 
                     # DeepSpeed always uses nccl
                     kwargs.pop("backend", None)
-                    self.backend = "nccl"
+                    self.backend = "cncl"
                     dist.init_distributed(dist_backend=self.backend, auto_mpi_discovery=False, **kwargs)
 
                 self.num_processes = torch.distributed.get_world_size()
@@ -177,24 +177,24 @@ class PartialState:
                         if self.device is not None:
                             torch.xpu.set_device(self.device)
                     else:
-                        self.device = torch.device("cuda", self.local_process_index)
+                        self.device = torch.device("mlu", self.local_process_index)
                         if self.device is not None:
-                            torch.cuda.set_device(self.device)
+                            torch.mlu.set_device(self.device)
                 self._mixed_precision = "no"  # deepspeed handles mixed_precision using deepspeed_config
             elif int(os.environ.get("LOCAL_RANK", -1)) != -1 and not cpu:
                 self.distributed_type = DistributedType.MULTI_GPU
                 if not torch.distributed.is_initialized():
-                    self.backend = kwargs.pop("backend", "nccl")
+                    self.backend = kwargs.pop("backend", "cncl")
                     # Special case for `TrainingArguments`, where `backend` will be `None`
                     if self.backend is None:
-                        self.backend = "nccl"
+                        self.backend = "cncl"
                     torch.distributed.init_process_group(backend=self.backend, **kwargs)
                 self.num_processes = torch.distributed.get_world_size()
                 self.process_index = torch.distributed.get_rank()
                 self.local_process_index = int(os.environ.get("LOCAL_RANK", -1))
                 if self.device is None:
-                    self.device = torch.device("cuda", self.local_process_index)
-                torch.cuda.set_device(self.device)
+                    self.device = torch.device("mlu", self.local_process_index)
+                torch.mlu.set_device(self.device)
             elif get_int_from_env(["PMI_SIZE", "OMPI_COMM_WORLD_SIZE", "MV2_COMM_WORLD_SIZE", "WORLD_SIZE"], 1) > 1:
                 if not cpu and is_xpu_available():
                     self.distributed_type = DistributedType.MULTI_XPU

@@ -29,6 +29,7 @@ from types import MethodType
 from typing import Any, Callable
 
 import torch
+import torch_mlu
 import torch.utils.hooks as hooks
 
 from .checkpointing import load_accelerator_state, load_custom_state, save_accelerator_state, save_custom_state
@@ -169,7 +170,7 @@ class Accelerator:
             dataloaders. Should be one or several of:
 
             - `"torch"`: the base torch random number generator
-            - `"cuda"`: the CUDA random number generator (GPU only)
+            - `"mlu"`: the mlu random number generator (GPU only)
             - `"xla"`: the XLA random number generator (TPU only)
             - `"generator"`: the `torch.Generator` of the sampler (or batch sampler if there is no sampler in your
               dataloader) or of the iterable dataset (if it exists) if the underlying dataset is of that type.
@@ -273,7 +274,7 @@ class Accelerator:
         if deepspeed_plugin:
             if not is_deepspeed_available():
                 raise ImportError("DeepSpeed is not installed => run `pip install deepspeed` or build it from source.")
-            if compare_versions("deepspeed", "<", "0.6.5"):
+            if compare_versions("cndsp", "<", "0.6.5"):
                 raise ImportError("DeepSpeed version must be >= 0.6.5. Please update DeepSpeed.")
 
             mixed_precision = (
@@ -405,7 +406,7 @@ class Accelerator:
             and self.distributed_type not in (DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM)
         ):
             self.native_amp = True
-            if self.device.type not in ("cuda", "mps"):
+            if self.device.type not in ("mlu", "mps"):
                 raise ValueError(err.format(mode="fp16", requirement="a GPU"))
             kwargs = self.scaler_handler.to_kwargs() if self.scaler_handler is not None else {}
             if self.distributed_type == DistributedType.FSDP:
@@ -413,7 +414,7 @@ class Accelerator:
 
                 self.scaler = ShardedGradScaler(**kwargs)
             else:
-                self.scaler = torch.cuda.amp.GradScaler(**kwargs)
+                self.scaler = torch.mlu.amp.GradScaler(**kwargs)
 
         elif self.state.mixed_precision == "bf16" and self.distributed_type not in (
             DistributedType.DEEPSPEED,
@@ -1304,14 +1305,14 @@ class Accelerator:
                 model = torch.nn.parallel.DistributedDataParallel(model, **kwargs)
         if self.native_amp:
             model._original_forward = model.forward
-            if self.mixed_precision == "fp16" and is_torch_version(">=", "1.10"):
-                model.forward = MethodType(torch.cuda.amp.autocast(dtype=torch.float16)(model.forward.__func__), model)
+            if self.mixed_precision == "fp16" and is_torch_version(">=", "1.9"):
+                model.forward = MethodType(torch.mlu.amp.autocast(dtype=torch.float16)(model.forward.__func__), model)
             elif self.mixed_precision == "bf16" and self.distributed_type != DistributedType.TPU:
                 model.forward = MethodType(
                     torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)(model.forward.__func__), model
                 )
             else:
-                model.forward = MethodType(torch.cuda.amp.autocast()(model.forward.__func__), model)
+                model.forward = MethodType(torch.mlu.amp.autocast()(model.forward.__func__), model)
             model.forward = MethodType(convert_outputs_to_fp32(model.forward.__func__), model)
         elif self.mixed_precision == "fp8":
             if not has_transformer_engine_layers(model):
@@ -1490,9 +1491,10 @@ class Accelerator:
                 if isinstance(optimizer, (DummyOptim)):
                     kwargs["model_parameters"] = optimizer.params
                 else:
+                    # cndsp 0.7.1 not support cuda kernel
                     if self.deepspeed_config["zero_optimization"].get("offload_optimizer", {}).get(
                         "device", "none"
-                    ) != "none" and self.deepspeed_config.get("zero_force_ds_cpu_optimizer", True):
+                    ) != "none" and self.deepspeed_config.get("zero_force_ds_cpu_optimizer", False):
                         from deepspeed.ops.adam import DeepSpeedCPUAdam
 
                         defaults = {k: v for k, v in optimizer.defaults.items() if k in ["lr", "weight_decay"]}

@@ -29,8 +29,8 @@ def notebook_launcher(function, args=(), num_processes=None, mixed_precision="no
 
     <Tip warning={true}>
 
-    To use this function absolutely zero calls to a CUDA device must be made in the notebook session before calling. If
-    any have been made, you will need to restart the notebook and make sure no cells use any CUDA capability.
+    To use this function absolutely zero calls to a mlu device must be made in the notebook session before calling. If
+    any have been made, you will need to restart the notebook and make sure no cells use any mlu capability.
 
     </Tip>
 
@@ -96,7 +96,7 @@ def notebook_launcher(function, args=(), num_processes=None, mixed_precision="no
         xmp.spawn(launcher, args=args, nprocs=num_processes, start_method="fork")
     elif in_colab:
         # No need for a distributed launch otherwise as it's either CPU or one GPU.
-        if torch.cuda.is_available():
+        if torch.mlu.is_available():
             print("Launching training on one GPU.")
         else:
             print("Launching training on one CPU.")
@@ -119,10 +119,10 @@ def notebook_launcher(function, args=(), num_processes=None, mixed_precision="no
                     "`Accelerator`."
                 )
 
-            if torch.cuda.is_initialized():
+            if torch.mlu.is_initialized():
                 raise ValueError(
                     "To launch a multi-GPU training from your notebook, you need to avoid running any instruction "
-                    "using `torch.cuda` in any cell. Restart your notebook and make sure no cells use any CUDA "
+                    "using `torch.mlu` in any cell. Restart your notebook and make sure no cells use any mlu "
                     "function."
                 )
 
@@ -151,6 +151,8 @@ def notebook_launcher(function, args=(), num_processes=None, mixed_precision="no
                 print("Launching training on MPS.")
             elif torch.cuda.is_available():
                 print("Launching training on one GPU.")
+            elif torch.mlu.is_available():
+                print("Launching training on one MLU.")
             else:
                 print("Launching training on CPU.")
             function(*args)

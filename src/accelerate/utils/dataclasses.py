@@ -92,7 +92,7 @@ class DistributedDataParallelKwargs(KwargsHandler):
 class GradScalerKwargs(KwargsHandler):
     """
     Use this object in your [`Accelerator`] to customize the behavior of mixed precision, specifically how the
-    `torch.cuda.amp.GradScaler` used is created. Please refer to the documentation of this
+    `torch.mlu.amp.GradScaler` used is created. Please refer to the documentation of this
     [scaler](https://pytorch.org/docs/stable/amp.html?highlight=gradscaler) for more information on each argument.
 
     <Tip warning={true}>
@@ -339,7 +339,7 @@ class RNGType(BaseEnum):
     XLA = "xla"
     XPU = "xpu"
     GENERATOR = "generator"
-
+    MLU = "mlu"
 
 # data classes
 

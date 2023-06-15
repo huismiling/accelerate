@@ -19,7 +19,7 @@ from typing import List
 
 import numpy as np
 import torch
-from torch.cuda.amp import GradScaler
+from torch.mlu.amp import GradScaler
 
 from .utils import (
     MODEL_NAME,
@@ -66,7 +66,7 @@ def save_accelerator_state(
             A list of learning rate schedulers
         process_index (`int`):
             The current process index in the Accelerator state
-        scaler (`torch.cuda.amp.GradScaler`, *optional*):
+        scaler (`torch.mlu.amp.GradScaler`, *optional*):
             An optional gradient scaler instance to save
     """
     # Model states
@@ -104,7 +104,7 @@ def save_accelerator_state(
     if is_xpu_available():
         states["torch_xpu_manual_seed"] = torch.xpu.get_rng_state_all()
     else:
-        states["torch_cuda_manual_seed"] = torch.cuda.get_rng_state_all()
+        states["torch_mlu_manual_seed"] = torch.mlu.get_rng_state_all()
     if is_tpu_available():
         states["xm_seed"] = xm.get_rng_state()
     output_states_file = os.path.join(output_dir, states_name)
@@ -137,7 +137,7 @@ def load_accelerator_state(
             A list of learning rate schedulers
         process_index (`int`):
             The current process index in the Accelerator state
-        scaler (`torch.cuda.amp.GradScaler`, *optional*):
+        scaler (`torch.mlu.amp.GradScaler`, *optional*):
             An optional *GradScaler* instance to load
         map_location (`str`, *optional*):
             What device to load the optimizer state onto. Should be one of either "cpu" or "on_device".
@@ -189,7 +189,7 @@ def load_accelerator_state(
         if is_xpu_available():
             torch.xpu.set_rng_state_all(states["torch_xpu_manual_seed"])
         else:
-            torch.cuda.set_rng_state_all(states["torch_cuda_manual_seed"])
+            torch.mlu.set_rng_state_all(states["torch_mlu_manual_seed"])
         if is_tpu_available():
             xm.set_rng_state(states["xm_seed"])
         logger.info("All random states loaded successfully")

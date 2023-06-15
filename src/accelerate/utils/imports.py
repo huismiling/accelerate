@@ -102,7 +102,15 @@ def is_tpu_available(check_device=True):
 
 
 def is_deepspeed_available():
-    return _is_package_available("deepspeed")
+    package_exists = importlib.util.find_spec("deepspeed") is not None
+    # Check we're not importing a "deepspeed" directory somewhere but the actual library by trying to grab the version
+    # AND checking it has an author field in the metadata that is HuggingFace.
+    if package_exists:
+        try:
+            _ = importlib_metadata.metadata("cndsp")
+            return True
+        except importlib_metadata.PackageNotFoundError:
+            return False
 
 
 def is_bf16_available(ignore_tpu=False):
@@ -110,8 +118,8 @@ def is_bf16_available(ignore_tpu=False):
     if is_tpu_available():
         return not ignore_tpu
     if is_torch_version(">=", "1.10"):
-        if torch.cuda.is_available():
-            return torch.cuda.is_bf16_supported()
+        if torch.mlu.is_available():
+            return torch.mlu.is_bf16_supported()
         return True
     return False
 

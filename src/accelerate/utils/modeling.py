@@ -459,6 +459,13 @@ def get_max_layer_size(
             modules_to_treat = [(f"{module_name}.{n}", v) for n, v in modules_children] + modules_to_treat
     return max_size, layer_names
 
+def mlu_mem_get_info(dev_id):
+    total_memory = torch.mlu.get_device_properties(dev_id).total_memory
+    allocated_memory = torch.mlu.max_memory_allocated(dev_id)
+    cache_memory = torch.mlu.max_memory_cached(dev_id)
+    reserved_memory = torch.mlu.max_memory_reserved(dev_id)
+    free_mem = total_memory - allocated_memory - cache_memory - reserved_memory - 4*1024*1024*1024
+    return free_mem, total_memory
 
 def get_max_memory(max_memory: Optional[Dict[Union[int, str], Union[int, str]]] = None):
     """
@@ -467,7 +474,7 @@ def get_max_memory(max_memory: Optional[Dict[Union[int, str], Union[int, str]]] 
     import psutil
 
     if max_memory is None:
-        if not (torch.cuda.is_available() or is_xpu_available()):
+        if not (torch.mlu.is_available() or is_xpu_available()):
             max_memory = {}
 
         else:
@@ -475,7 +482,8 @@ def get_max_memory(max_memory: Optional[Dict[Union[int, str], Union[int, str]]] 
             if not is_xpu_available():
                 for i in range(torch.cuda.device_count()):
                     _ = torch.tensor([0], device=i)
-                max_memory = {i: torch.cuda.mem_get_info(i)[0] for i in range(torch.cuda.device_count())}
+                # max_memory = {i: torch.cuda.mem_get_info(i)[0] for i in range(torch.cuda.device_count())}
+                max_memory = {i: mlu_mem_get_info(i)[0] for i in range(torch.mlu.device_count())}
             else:
                 for i in range(torch.xpu.device_count()):
                     _ = torch.tensor(0, device=torch.device("xpu", i))
@@ -576,11 +584,11 @@ def get_balanced_memory(
     # Get default / clean up max_memory
     max_memory = get_max_memory(max_memory)
 
-    if not (torch.cuda.is_available() or is_xpu_available()) or is_mps_available():
+    if not (torch.mlu.is_available() or is_xpu_available()) or is_mps_available():
         return max_memory
 
     if not is_xpu_available():
-        num_devices = len([d for d in max_memory if torch.device(d).type == "cuda" and max_memory[d] > 0])
+        num_devices = len([d for d in max_memory if torch.device(d).type == "mlu" and max_memory[d] > 0])
     else:
         num_devices = len([d for d in max_memory if torch.device(d).type == "xpu" and max_memory[d] > 0])
 
