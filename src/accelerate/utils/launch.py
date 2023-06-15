@@ -22,7 +22,7 @@ import torch
 
 from ..commands.config.config_args import SageMakerConfig
 from ..commands.config.config_utils import DYNAMO_BACKENDS
-from ..utils import DynamoBackend, PrecisionType, is_torch_version, is_xpu_available
+from ..utils import DynamoBackend, PrecisionType, is_ipex_available, is_torch_version, is_xpu_available
 from ..utils.constants import DEEPSPEED_MULTINODE_LAUNCHERS
 from ..utils.other import merge_dicts
 from .dataclasses import DistributedType, SageMakerDistributedType
@@ -114,13 +114,9 @@ def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> Tuple[List[str]
     current_env["ACCELERATE_DYNAMO_USE_DYNAMIC"] = str(args.dynamo_use_dynamic)
 
     current_env["OMP_NUM_THREADS"] = str(args.num_cpu_threads_per_process)
-
-    if args.cpu or args.use_cpu:
-        if args.ipex_enabled:
-            current_env["IPEX_ENABLED"] = str(args.ipex_enabled).lower()
-    elif is_xpu_available():
-        if args.xpu_enabled:
-            current_env["XPU_ENABLED"] = str(args.xpu_enabled).lower()
+    if is_ipex_available():
+        current_env["ACCELERATE_USE_IPEX"] = str(args.ipex).lower()
+        current_env["ACCELERATE_USE_XPU"] = str(args.use_xpu).lower()
     return cmd, current_env
 
 
@@ -190,6 +186,9 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> Dict[str, str]:
             current_env["FSDP_BACKWARD_PREFETCH"] = str(args.fsdp_backward_prefetch_policy)
         if args.fsdp_state_dict_type is not None:
             current_env["FSDP_STATE_DICT_TYPE"] = str(args.fsdp_state_dict_type)
+        current_env["FSDP_FORWARD_PREFETCH"] = str(args.fsdp_forward_prefetch).lower()
+        current_env["FSDP_USE_ORIG_PARAMS"] = str(args.fsdp_use_orig_params).lower()
+        current_env["FSDP_SYNC_MODULE_STATES"] = str(args.fsdp_sync_module_states).lower()
 
     if args.use_megatron_lm:
         prefix = "MEGATRON_LM_"

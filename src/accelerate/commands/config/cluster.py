@@ -104,15 +104,14 @@ def get_cluster_input():
 
     ipex_config = {}
     if use_cpu:
-        ipex_config["ipex_enabled"] = _ask_field(
+        ipex_config["ipex"] = _ask_field(
             "Do you want to use Intel PyTorch Extension (IPEX) to speed up training on CPU? [yes/NO]:",
             _convert_yes_no_to_bool,
             default=False,
             error_message="Please enter yes or no.",
         )
-    xpu_config = {}
     if not use_cpu and is_xpu_available():
-        ipex_config["xpu_enabled"] = _ask_field(
+        ipex_config["use_xpu"] = _ask_field(
             "Do you want to use XPU plugin to speed up training on XPU? [yes/NO]:",
             _convert_yes_no_to_bool,
             default=False,
@@ -205,6 +204,18 @@ def get_cluster_input():
                     deepspeed_config["offload_param_device"] = _ask_options(
                         "Where to offload parameters?", deepspeed_devices, lambda x: deepspeed_devices[int(x)]
                     )
+                    if deepspeed_config["offload_param_device"] == "nvme":
+                        deepspeed_config["offload_param_nvme_path"] = _ask_field(
+                            "Nvme Path to offload parameters?",
+                            str,
+                            default="/nvme",
+                        )
+                    if deepspeed_config["offload_optimizer_device"] == "nvme":
+                        deepspeed_config["offload_optimizer_nvme_path"] = _ask_field(
+                            "Nvme Path to offload optimizer states?",
+                            str,
+                            default="/nvme",
+                        )
                 deepspeed_config["gradient_accumulation_steps"] = _ask_field(
                     "How many gradient accumulation steps you're passing in your script? [1]: ",
                     int,
@@ -337,6 +348,25 @@ def get_cluster_input():
                 fsdp_state_dict_type_query,
                 FSDP_STATE_DICT_TYPE,
                 lambda x: FSDP_STATE_DICT_TYPE[int(x)],
+                default=2,
+            )
+            fsdp_config["fsdp_forward_prefetch"] = _ask_field(
+                "Do you want to enable FSDP's forward prefetch policy? [yes/NO]: ",
+                _convert_yes_no_to_bool,
+                default=False,
+                error_message="Please enter yes or no.",
+            )
+            fsdp_config["fsdp_use_orig_params"] = _ask_field(
+                "Do you want to enable FSDP's `use_orig_params` feature? [yes/NO]: ",
+                _convert_yes_no_to_bool,
+                default=False,
+                error_message="Please enter yes or no.",
+            )
+            fsdp_config["fsdp_sync_module_states"] = _ask_field(
+                "Do you want each individually wrapped FSDP unit to broadcast module parameters from rank 0 at the start? [yes/NO]: ",
+                _convert_yes_no_to_bool,
+                default=False,
+                error_message="Please enter yes or no.",
             )
 
     megatron_lm_config = {}
@@ -437,7 +467,11 @@ def get_cluster_input():
     else:
         num_processes = 1
 
-    if distributed_type in [DistributedType.MULTI_GPU, DistributedType.NO] and not use_cpu and not use_mps:
+    if (
+        distributed_type in [DistributedType.MULTI_GPU, DistributedType.MULTI_XPU, DistributedType.NO]
+        and not use_cpu
+        and not use_mps
+    ):
         gpu_ids = _ask_field(
             "What GPU(s) (by id) should be used for training on this machine as a comma-seperated list? [all]:",
             default="all",
@@ -555,7 +589,6 @@ def get_cluster_input():
         fsdp_config=fsdp_config,
         megatron_lm_config=megatron_lm_config,
         ipex_config=ipex_config,
-        xpu_config=xpu_config,
         use_cpu=use_cpu,
         rdzv_backend=rdzv_backend,
         same_network=same_network,

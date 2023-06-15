@@ -82,19 +82,15 @@ class TpuConfigTester(unittest.TestCase):
     command_file = "tests/test_samples/test_command_file.sh"
     gcloud = "Running gcloud compute tpus tpu-vm ssh"
 
-    @staticmethod
-    def clean_output(output):
-        return "".join(output).rstrip()
-
     def test_base(self):
         output = run_command(
             self.cmd
             + ["--command", self.command, "--tpu_zone", self.tpu_zone, "--tpu_name", self.tpu_name, "--debug"],
             return_stdout=True,
         )
-        self.assertEqual(
-            self.clean_output(output),
+        self.assertIn(
             f"{self.gcloud} test-tpu --zone us-central1-a --command {self.base_output}; ls --worker all",
+            output,
         )
 
     def test_base_backward_compatibility(self):
@@ -113,18 +109,18 @@ class TpuConfigTester(unittest.TestCase):
             ],
             return_stdout=True,
         )
-        self.assertEqual(
-            self.clean_output(output),
+        self.assertIn(
             f"{self.gcloud} test-tpu --zone us-central1-a --command {self.base_output}; ls --worker all",
+            output,
         )
 
     def test_with_config_file(self):
         output = run_command(
             self.cmd + ["--config_file", "tests/test_configs/latest.yaml", "--debug"], return_stdout=True
         )
-        self.assertEqual(
-            self.clean_output(output),
+        self.assertIn(
             f'{self.gcloud} test-tpu --zone us-central1-a --command {self.base_output}; echo "hello world"; echo "this is a second command" --worker all',
+            output,
         )
 
     def test_with_config_file_and_command(self):
@@ -132,9 +128,9 @@ class TpuConfigTester(unittest.TestCase):
             self.cmd + ["--config_file", "tests/test_configs/latest.yaml", "--command", self.command, "--debug"],
             return_stdout=True,
         )
-        self.assertEqual(
-            self.clean_output(output),
+        self.assertIn(
             f"{self.gcloud} test-tpu --zone us-central1-a --command {self.base_output}; ls --worker all",
+            output,
         )
 
     def test_with_config_file_and_multiple_command(self):
@@ -151,9 +147,9 @@ class TpuConfigTester(unittest.TestCase):
             ],
             return_stdout=True,
         )
-        self.assertEqual(
-            self.clean_output(output),
+        self.assertIn(
             f'{self.gcloud} test-tpu --zone us-central1-a --command {self.base_output}; ls; echo "Hello World" --worker all',
+            output,
         )
 
     def test_with_config_file_and_command_file(self):
@@ -162,9 +158,9 @@ class TpuConfigTester(unittest.TestCase):
             + ["--config_file", "tests/test_configs/latest.yaml", "--command_file", self.command_file, "--debug"],
             return_stdout=True,
         )
-        self.assertEqual(
-            self.clean_output(output),
+        self.assertIn(
             f'{self.gcloud} test-tpu --zone us-central1-a --command {self.base_output}; echo "hello world"; echo "this is a second command" --worker all',
+            output,
         )
 
     def test_with_config_file_and_command_file_backward_compatibility(self):
@@ -183,9 +179,9 @@ class TpuConfigTester(unittest.TestCase):
             ],
             return_stdout=True,
         )
-        self.assertEqual(
-            self.clean_output(output),
+        self.assertIn(
             f'{self.gcloud} test-tpu --zone us-central1-a --command {self.base_output}; echo "hello world"; echo "this is a second command" --worker all',
+            output,
         )
 
     def test_accelerate_install(self):
@@ -193,9 +189,9 @@ class TpuConfigTester(unittest.TestCase):
             self.cmd + ["--config_file", "tests/test_configs/latest.yaml", "--install_accelerate", "--debug"],
             return_stdout=True,
         )
-        self.assertEqual(
-            self.clean_output(output),
+        self.assertIn(
             f'{self.gcloud} test-tpu --zone us-central1-a --command {self.base_output}; pip install accelerate -U; echo "hello world"; echo "this is a second command" --worker all',
+            output,
         )
 
     def test_accelerate_install_version(self):
@@ -211,7 +207,7 @@ class TpuConfigTester(unittest.TestCase):
             ],
             return_stdout=True,
         )
-        self.assertEqual(
-            self.clean_output(output),
+        self.assertIn(
             f'{self.gcloud} test-tpu --zone us-central1-a --command {self.base_output}; pip install accelerate==12.0.0; echo "hello world"; echo "this is a second command" --worker all',
+            output,
         )

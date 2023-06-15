@@ -75,7 +75,7 @@ def training_function(config, args):
     # Initialize accelerator
     if args.with_tracking:
         accelerator = Accelerator(
-            cpu=args.cpu, mixed_precision=args.mixed_precision, log_with="all", logging_dir=args.logging_dir
+            cpu=args.cpu, mixed_precision=args.mixed_precision, log_with="all", project_dir=args.project_dir
         )
     else:
         accelerator = Accelerator(cpu=args.cpu, mixed_precision=args.mixed_precision)
@@ -205,9 +205,12 @@ def training_function(config, args):
             total_loss = 0
         if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
             # We need to skip steps until we reach the resumed step
-            train_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
+            active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
             overall_step += resume_step
-        for batch in train_dataloader:
+        else:
+            # After the first iteration though, we need to go back to the original dataloader
+            active_dataloader = train_dataloader
+        for batch in active_dataloader:
             # We could avoid this line since we set the accelerator with `device_placement=True`.
             batch = {k: v.to(accelerator.device) for k, v in batch.items()}
             inputs = (batch["image"] - mean) / std
@@ -302,10 +305,10 @@ def main():
         help="Whether to load in all available experiment trackers from the environment and use them for logging.",
     )
     parser.add_argument(
-        "--logging_dir",
+        "--project_dir",
         type=str,
         default="logs",
-        help="Location on where to store experiment tracking logs`",
+        help="Location on where to store experiment tracking logs` and relevent project information",
     )
     args = parser.parse_args()
     config = {"lr": 3e-2, "num_epochs": 3, "seed": 42, "batch_size": 64, "image_size": 224}

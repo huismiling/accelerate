@@ -87,6 +87,9 @@ def is_fp8_available():
 @lru_cache()
 def is_tpu_available(check_device=True):
     "Checks if `torch_xla` is installed and potentially if a TPU is in the environment"
+    # Due to bugs on the amp series GPUs, we disable torch-xla on them
+    if torch.cuda.is_available():
+        return False
     if _tpu_available and check_device:
         try:
             # Will raise a RuntimeError if no XLA configuration is found
@@ -163,12 +166,6 @@ def is_boto3_available():
 
 def is_rich_available():
     if _is_package_available("rich"):
-        if parse_flag_from_env("DISABLE_RICH"):
-            warnings.warn(
-                "The `DISABLE_RICH` flag is deprecated and will be removed in version 0.17.0 of 🤗 Accelerate. Use `ACCELERATE_DISABLE_RICH` instead.",
-                FutureWarning,
-            )
-            return not parse_flag_from_env("DISABLE_RICH")
         return not parse_flag_from_env("ACCELERATE_DISABLE_RICH")
     return False
 
@@ -214,6 +211,9 @@ def is_ipex_available():
 
 @lru_cache()
 def is_xpu_available(check_device=False):
+    "check if user disables it explicitly"
+    if not parse_flag_from_env("ACCELERATE_USE_XPU", default=True):
+        return False
     "Checks if `intel_extension_for_pytorch` is installed and potentially if a XPU is in the environment"
     if is_ipex_available():
         import torch
@@ -223,6 +223,8 @@ def is_xpu_available(check_device=False):
     else:
         return False
 
+    import intel_extension_for_pytorch  # noqa: F401
+
     if check_device:
         try:
             # Will raise a RuntimeError if no XPU  is found
@@ -230,4 +232,4 @@ def is_xpu_available(check_device=False):
             return torch.xpu.is_available()
         except RuntimeError:
             return False
-    return torch.xpu.is_available()
+    return hasattr(torch, "xpu") and torch.xpu.is_available()

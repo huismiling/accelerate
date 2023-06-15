@@ -38,6 +38,7 @@ from accelerate.utils import (
     is_rich_available,
     is_sagemaker_available,
     is_torch_version,
+    is_xpu_available,
     patch_environment,
     prepare_deepspeed_cmd_env,
     prepare_multi_gpu_env,
@@ -155,6 +156,12 @@ def launch_command_parser(subparsers=None):
     hardware_args.add_argument(
         "--tpu", default=False, action="store_true", help="Whether or not this should launch a TPU training."
     )
+    hardware_args.add_argument(
+        "--ipex",
+        default=False,
+        action="store_true",
+        help="Whether or not this should launch a Intel PyTorch Extension (IPEX) training.",
+    )
 
     # Resource selection arguments
     resource_args = parser.add_argument_group(
@@ -231,6 +238,12 @@ def launch_command_parser(subparsers=None):
         action="store_true",
         help="Whether to use Megatron-LM.",
     )
+    paradigm_args.add_argument(
+        "--use_xpu",
+        default=False,
+        action="store_true",
+        help="Whether to use IPEX plugin to speed up training on XPU specifically.",
+    )
 
     # distributed GPU training arguments
     distributed_args = parser.add_argument_group("Distributed GPUs", "Arguments related to distributed GPU training.")
@@ -271,6 +284,12 @@ def launch_command_parser(subparsers=None):
         help="User-defined role for the workers.",
     )
     # Rendezvous related arguments
+    distributed_args.add_argument(
+        "--rdzv_backend",
+        type=str,
+        default="static",
+        help="The rendezvous method to use, such as 'static' (the default) or 'c10d'",
+    )
     distributed_args.add_argument(
         "--rdzv_conf",
         type=str,
@@ -377,6 +396,20 @@ def launch_command_parser(subparsers=None):
         "If unspecified, will default to 'none'.",
     )
     deepspeed_args.add_argument(
+        "--offload_optimizer_nvme_path",
+        default=None,
+        type=str,
+        help="Decides Nvme Path to offload optimizer states (useful only when `use_deepspeed` flag is passed). "
+        "If unspecified, will default to 'none'.",
+    )
+    deepspeed_args.add_argument(
+        "--offload_param_nvme_path",
+        default=None,
+        type=str,
+        help="Decides Nvme Path to offload parameters (useful only when `use_deepspeed` flag is passed). "
+        "If unspecified, will default to 'none'.",
+    )
+    deepspeed_args.add_argument(
         "--gradient_accumulation_steps",
         default=None,
         type=int,
@@ -474,6 +507,27 @@ def launch_command_parser(subparsers=None):
         type=str,
         help="FSDP's state dict type. (useful only when `use_fsdp` flag is passed).",
     )
+    fsdp_args.add_argument(
+        "--fsdp_forward_prefetch",
+        default="false",
+        type=str,
+        help="If True, then FSDP explicitly prefetches the next upcoming "
+        "all-gather while executing in the forward pass (useful only when `use_fsdp` flag is passed).",
+    )
+    fsdp_args.add_argument(
+        "--fsdp_use_orig_params",
+        default="false",
+        type=str,
+        help="If True, allows non-uniform `requires_grad` during init, which means support for interspersed frozen and trainable paramteres."
+        " (useful only when `use_fsdp` flag is passed).",
+    )
+    fsdp_args.add_argument(
+        "--fsdp_sync_module_states",
+        default="false",
+        type=str,
+        help="If True, each individually wrapped FSDP unit will broadcast module parameters from rank 0."
+        " (useful only when `use_fsdp` flag is passed).",
+    )
 
     # megatron_lm args
     megatron_lm_args = parser.add_argument_group("Megatron-LM Arguments", "Arguments related to Megatron-LM.")
@@ -551,23 +605,6 @@ def launch_command_parser(subparsers=None):
             "The full path to the script to be launched in parallel, followed by all the arguments for the training "
             "script."
         ),
-    )
-
-    # ipex args
-    ipex_args = parser.add_argument_group("IPEX Arguments", "Arguments related to IPEX.")
-    ipex_args.add_argument(
-        "--ipex_enabled",
-        default=False,
-        action="store_true",
-        help="Whether to use Intel PyTorch Extension (IPEX) to speed up training on CPU and XPU?",
-    )
-    # xpu args
-    xpu_args = parser.add_argument_group("XPU Arguments", "Arguments related to XPU.")
-    xpu_args.add_argument(
-        "--xpu_enabled",
-        default=False,
-        action="store_true",
-        help="Whether to use IPEX plugin to speed up training on XPU?",
     )
 
     # Other arguments of the training scripts
@@ -797,7 +834,9 @@ def _validate_launch_command(args):
             and not args.use_megatron_lm
         ):
             args.use_deepspeed = defaults.distributed_type == DistributedType.DEEPSPEED
-            args.multi_gpu = defaults.distributed_type == DistributedType.MULTI_GPU
+            args.multi_gpu = (
+                True if defaults.distributed_type in (DistributedType.MULTI_GPU, DistributedType.MULTI_XPU) else False
+            )
             args.tpu = defaults.distributed_type == DistributedType.TPU
             args.use_fsdp = defaults.distributed_type == DistributedType.FSDP
             args.use_megatron_lm = defaults.distributed_type == DistributedType.MEGATRON_LM
@@ -833,8 +872,6 @@ def _validate_launch_command(args):
                         setattr(args, k, defaults.dynamo_config[k])
                     for k in defaults.ipex_config:
                         setattr(args, k, defaults.ipex_config[k])
-                    for k in defaults.xpu_config:
-                        setattr(args, k, defaults.xpu_config[k])
                     continue
 
                 # Those args are handled separately
@@ -855,14 +892,19 @@ def _validate_launch_command(args):
             args.dynamo_backend = "no"
     else:
         if args.num_processes is None:
-            args.num_processes = torch.mlu.device_count()
+            if args.use_xpu and is_xpu_available():
+                args.num_processes = torch.xpu.device_count()
+            else:
+                args.num_processes = torch.mlu.device_count()
             warned.append(f"\t`--num_processes` was set to a value of `{args.num_processes}`")
-            if torch.mlu.device_count() > 1 and not args.multi_gpu:
-                warned.append(
-                    "\t\tMore than one GPU was found, enabling multi-GPU training.\n"
-                    "\t\tIf this was unintended please pass in `--num_processes=1`."
-                )
-                args.multi_gpu = True
+        if not args.multi_gpu and (
+            (args.use_xpu and is_xpu_available() and torch.xpu.device_count() > 1) or (torch.mlu.device_count() > 1)
+        ):
+            warned.append(
+                "\t\tMore than one GPU was found, enabling multi-GPU training.\n"
+                "\t\tIf this was unintended please pass in `--num_processes=1`."
+            )
+            args.multi_gpu = True
         if args.num_machines is None:
             warned.append("\t`--num_machines` was set to a value of `1`")
             args.num_machines = 1
@@ -903,7 +945,6 @@ def _validate_launch_command(args):
 
 def launch_command(args):
     args, defaults, mp_from_config_flag = _validate_launch_command(args)
-
     # Use the proper launcher
     if args.use_deepspeed and not args.cpu:
         args.deepspeed_fields_from_accelerate_config = list(defaults.deepspeed_config.keys()) if defaults else []

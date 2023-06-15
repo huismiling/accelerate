@@ -6,7 +6,7 @@ from unittest.mock import patch
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from accelerate import infer_auto_device_map, init_empty_weights
+from accelerate import DistributedType, infer_auto_device_map, init_empty_weights
 from accelerate.accelerator import Accelerator
 from accelerate.state import GradientState, PartialState
 from accelerate.test_utils import require_multi_gpu, slow
@@ -175,6 +175,59 @@ class AcceleratorTester(AccelerateTestCase):
             # mode.class_name is NOT loaded from config
             self.assertTrue(model.class_name != model.__class__.__name__)
 
+    def test_accelerator_none(self):
+        """Just test that passing None to accelerator.prepare() works."""
+        accelerator = Accelerator()
+        model, optimizer, scheduler, train_dl, valid_dl = create_components()
+        dummy_obj = None
+
+        # This should work
+        model, optimizer, scheduler, train_dl, valid_dl, dummy_obj = accelerator.prepare(
+            model, optimizer, scheduler, train_dl, valid_dl, dummy_obj
+        )
+        self.assertTrue(dummy_obj is None)
+
+    def test_is_accelerator_prepared(self):
+        """Checks that `_is_accelerator_prepared` is set properly"""
+        accelerator = Accelerator()
+        model, optimizer, scheduler, train_dl, valid_dl = create_components()
+        dummy_obj = [1, 2, 3]
+
+        # This should work
+        model, optimizer, scheduler, train_dl, valid_dl, dummy_obj = accelerator.prepare(
+            model, optimizer, scheduler, train_dl, valid_dl, dummy_obj
+        )
+        self.assertEqual(
+            getattr(dummy_obj, "_is_accelerate_prepared", False),
+            False,
+            "Dummy object should have `_is_accelerate_prepared` set to `True`",
+        )
+        self.assertEqual(
+            getattr(model, "_is_accelerate_prepared", False),
+            True,
+            "Model is missing `_is_accelerator_prepared` or is set to `False`",
+        )
+        self.assertEqual(
+            getattr(optimizer, "_is_accelerate_prepared", False),
+            True,
+            "Optimizer is missing `_is_accelerator_prepared` or is set to `False`",
+        )
+        self.assertEqual(
+            getattr(scheduler, "_is_accelerate_prepared", False),
+            True,
+            "Scheduler is missing `_is_accelerator_prepared` or is set to `False`",
+        )
+        self.assertEqual(
+            getattr(train_dl, "_is_accelerate_prepared", False),
+            True,
+            "Train Dataloader is missing `_is_accelerator_prepared` or is set to `False`",
+        )
+        self.assertEqual(
+            getattr(valid_dl, "_is_accelerate_prepared", False),
+            True,
+            "Valid Dataloader is missing `_is_accelerator_prepared` or is set to `False`",
+        )
+
     @slow
     def test_accelerator_bnb(self):
         """Tests that the accelerator can be used with the BNB library."""
@@ -202,6 +255,7 @@ class AcceleratorTester(AccelerateTestCase):
             model = AutoModelForCausalLM.from_pretrained(
                 "EleutherAI/gpt-neo-125m",
             )
+            model.tie_weights()
             device_map = infer_auto_device_map(model)
             device_map["lm_head"] = "cpu"
 
@@ -219,6 +273,35 @@ class AcceleratorTester(AccelerateTestCase):
         """Tests that the accelerator can be used with the BNB library."""
         from transformers import AutoModelForCausalLM
 
+        PartialState._shared_state = {"distributed_type": DistributedType.MULTI_GPU}
+
+        with init_empty_weights():
+            model = AutoModelForCausalLM.from_pretrained(
+                "EleutherAI/gpt-neo-125m",
+            )
+            model.tie_weights()
+            device_map = infer_auto_device_map(model)
+            device_map["lm_head"] = 1
+
+        model = AutoModelForCausalLM.from_pretrained(
+            "EleutherAI/gpt-neo-125m",
+            load_in_8bit=True,
+            device_map=device_map,
+        )
+        accelerator = Accelerator()
+
+        # This should not work and get value error
+        with self.assertRaises(ValueError):
+            _ = accelerator.prepare(model)
+
+        PartialState._reset_state()
+
+    @slow
+    @require_multi_gpu
+    def test_accelerator_bnb_multi_gpu_no_distributed(self):
+        """Tests that the accelerator can be used with the BNB library."""
+        from transformers import AutoModelForCausalLM
+
         with init_empty_weights():
             model = AutoModelForCausalLM.from_pretrained(
                 "EleutherAI/gpt-neo-125m",
@@ -233,9 +316,8 @@ class AcceleratorTester(AccelerateTestCase):
         )
         accelerator = Accelerator()
 
-        # This should not work and get value error
-        with self.assertRaises(ValueError):
-            _ = accelerator.prepare(model)
+        # This should work
+        _ = accelerator.prepare(model)
 
     @require_cuda
     def test_accelerator_cpu_flag_prepare(self):

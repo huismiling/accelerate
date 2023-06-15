@@ -135,7 +135,7 @@ def recursively_apply(func, data, *args, test_type=is_torch_tensor, error_on_oth
     return data
 
 
-def send_to_device(tensor, device, non_blocking=False):
+def send_to_device(tensor, device, non_blocking=False, skip_keys=None):
     """
     Recursively sends the elements in a nested list/tuple/dictionary of tensors to a given device.
 
@@ -148,17 +148,28 @@ def send_to_device(tensor, device, non_blocking=False):
     Returns:
         The same data structure as `tensor` with all tensors sent to the proper device.
     """
-
-    def _send_to_device(t, device, non_blocking):
+    if isinstance(tensor, (tuple, list)):
+        return honor_type(
+            tensor, (send_to_device(t, device, non_blocking=non_blocking, skip_keys=skip_keys) for t in tensor)
+        )
+    elif isinstance(tensor, Mapping):
+        if isinstance(skip_keys, str):
+            skip_keys = [skip_keys]
+        elif skip_keys is None:
+            skip_keys = []
+        return type(tensor)(
+            {
+                k: t if k in skip_keys else send_to_device(t, device, non_blocking=non_blocking, skip_keys=skip_keys)
+                for k, t in tensor.items()
+            }
+        )
+    elif hasattr(tensor, "to"):
         try:
-            return t.to(device, non_blocking=non_blocking)
+            return tensor.to(device, non_blocking=non_blocking)
         except TypeError:  # .to() doesn't accept non_blocking as kwarg
-            return t.to(device)
-
-    def _has_to_method(t):
-        return hasattr(t, "to")
-
-    return recursively_apply(_send_to_device, tensor, device, non_blocking, test_type=_has_to_method)
+            return tensor.to(device)
+    else:
+        return tensor
 
 
 def get_data_structure(data):
@@ -213,6 +224,29 @@ def find_batch_size(data):
     return data.shape[0]
 
 
+def listify(data):
+    """
+    Recursively finds tensors in a nested list/tuple/dictionary and converts them to a list of numbers.
+
+    Args:
+        data (nested list/tuple/dictionary of `torch.Tensor`): The data from which to convert to regular numbers.
+
+    Returns:
+        The same data structure as `data` with lists of numbers instead of `torch.Tensor`.
+    """
+
+    def _convert_to_list(tensor):
+        tensor = tensor.detach().cpu()
+        if tensor.dtype == torch.bfloat16:
+            # As of Numpy 1.21.4, NumPy does not support bfloat16 (see
+            # https://github.com/numpy/numpy/blob/a47ecdea856986cd60eabbd53265c2ca5916ad5d/doc/source/user/basics.types.rst ).
+            # Until Numpy adds bfloat16, we must convert float32.
+            tensor = tensor.to(torch.float32)
+        return tensor.tolist()
+
+    return recursively_apply(_convert_to_list, data)
+
+
 def _tpu_gather(tensor):
     def _tpu_gather_one(tensor):
         if tensor.ndim == 0:
@@ -229,7 +263,7 @@ def _gpu_gather(tensor):
     def _gpu_gather_one(tensor):
         if tensor.ndim == 0:
             tensor = tensor.clone()[None]
-        output_tensors = [tensor.clone() for _ in range(torch.distributed.get_world_size())]
+        output_tensors = [torch.empty_like(tensor) for _ in range(torch.distributed.get_world_size())]
         torch.distributed.all_gather(output_tensors, tensor)
         return torch.cat(output_tensors, dim=0)
 

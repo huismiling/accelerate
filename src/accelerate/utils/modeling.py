@@ -15,6 +15,7 @@
 import contextlib
 import enum
 import gc
+import inspect
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ import torch.nn as nn
 
 from ..state import AcceleratorState
 from .dataclasses import DistributedType
-from .imports import is_safetensors_available, is_torch_version, is_xpu_available
+from .imports import is_mps_available, is_safetensors_available, is_torch_version, is_xpu_available
 from .offload import load_offloaded_weight, offload_weight, save_offload_index
 from .tqdm import is_tqdm_available, tqdm
 
@@ -172,9 +173,9 @@ def set_module_tensor_to_device(
         elif value is not None or torch.device(device) != module._parameters[tensor_name].device:
             param_cls = type(module._parameters[tensor_name])
             kwargs = module._parameters[tensor_name].__dict__
-            if param_cls.__name__ == "Int8Params":
-                # downcast to fp16 if any
-                if new_value.dtype == torch.float32:
+            if param_cls.__name__ in ["Int8Params", "FP4Params"]:
+                if param_cls.__name__ == "Int8Params" and new_value.dtype == torch.float32:
+                    # downcast to fp16 if any - needed for 8bit serialization
                     new_value = new_value.to(torch.float16)
                 new_value = param_cls(new_value, requires_grad=old_value.requires_grad, **kwargs).to(device)
             else:
@@ -191,6 +192,11 @@ def set_module_tensor_to_device(
                     elif module.bias is None:
                         # if no bias exists, we can quantize right away
                         module = module.cuda(device_index)
+            elif module.__class__.__name__ == "Linear4bit" and getattr(module.weight, "quant_state", None) is None:
+                # quantize only if necessary
+                device_index = torch.device(device).index if torch.device(device).type == "cuda" else None
+                if not getattr(module.weight, "quant_state", None) and device_index is not None:
+                    module.weight = module.weight.cuda(device_index)
 
 
 def named_module_tensors(module: nn.Module, include_buffers: bool = True, recurse: bool = False):
@@ -226,6 +232,71 @@ class FindTiedParametersResult(list):
     def values(self):
         # TODO: at the next Transformers release (4.28.0) issue a deprecation warning here.
         return sum([x[1:] for x in self], [])
+
+
+def check_tied_parameters_in_config(model: nn.Module):
+    """
+    Check if there is any indication in the given model that some weights should be tied.
+
+    Args:
+        model (`torch.nn.Module`): The model to inspect
+
+    Returns:
+        bool: True if the model needs to have tied weights
+    """
+
+    # based on model.tie_weights() method
+    has_tied_word_embedding = False
+    has_tied_encoder_decoder = False
+    has_tied_module = False
+
+    if "PreTrainedModel" in [c.__name__ for c in inspect.getmro(model.__class__)]:
+        has_tied_word_embedding = (
+            hasattr(model, "config")
+            and getattr(model.config, "tie_word_embeddings", False)
+            and model.get_output_embeddings()
+        )
+        has_tied_encoder_decoder = (
+            hasattr(model, "config")
+            and getattr(model.config, "is_encoder_decoder", False)
+            and getattr(model.config, "tie_encoder_decoder", False)
+        )
+        has_tied_module = any(hasattr(module, "_tie_weights") for module in model.modules())
+
+    return any([has_tied_word_embedding, has_tied_encoder_decoder, has_tied_module])
+
+
+def _get_param_device(param, device_map):
+    if param in device_map:
+        return device_map[param]
+    parent_param = ".".join(param.split(".")[:-1])
+    if parent_param == param:
+        raise ValueError(f"The `device_map` does not contain the module {param}.")
+    else:
+        return _get_param_device(parent_param, device_map)
+
+
+def check_tied_parameters_on_same_device(tied_params, device_map):
+    """
+    Check if tied parameters are on the same device
+
+    Args:
+        tied_params (`List[List[str]]`):
+            A list of lists of parameter names being all tied together.
+
+        device_map (`Dict[str, Union[int, str, torch.device]]`):
+            A map that specifies where each submodule should go.
+
+    """
+    for tie_param in tied_params:
+        tie_param_devices = {}
+        for param in tie_param:
+            tie_param_devices[param] = _get_param_device(param, device_map)
+        if len(set(tie_param_devices.values())) > 1:
+            logger.warn(
+                f"Tied parameters are on different devices: {tie_param_devices}. "
+                "Please modify your custom device map or set `device_map='auto'`. "
+            )
 
 
 def find_tied_parameters(model: nn.Module, **kwargs):
@@ -417,7 +488,11 @@ def get_max_memory(max_memory: Optional[Dict[Union[int, str], Union[int, str]]] 
                 for i in range(torch.xpu.device_count()):
                     _ = torch.tensor(0, device=torch.device("xpu", i))
                 max_memory = {i: torch.xpu.max_memory_allocated(i) for i in range(torch.xpu.device_count())}
-        max_memory["cpu"] = psutil.virtual_memory().available
+        # allocate everything in the mps device as the RAM is shared
+        if is_mps_available():
+            max_memory["mps"] = psutil.virtual_memory().available
+        else:
+            max_memory["cpu"] = psutil.virtual_memory().available
         return max_memory
 
     for key in max_memory:
@@ -509,7 +584,7 @@ def get_balanced_memory(
     # Get default / clean up max_memory
     max_memory = get_max_memory(max_memory)
 
-    if not (torch.mlu.is_available() or is_xpu_available()):
+    if not (torch.mlu.is_available() or is_xpu_available()) or is_mps_available():
         return max_memory
 
     if not is_xpu_available():
@@ -625,10 +700,20 @@ def infer_auto_device_map(
         devices.append("disk")
 
     # Devices that need to keep space for a potential offloaded layer.
-    main_devices = [gpus[0], "cpu"] if len(gpus) > 0 else ["cpu"]
+    if "mps" in gpus:
+        main_devices = ["mps"]
+    elif len(gpus) > 0:
+        main_devices = [gpus[0], "cpu"]
+    else:
+        main_devices = ["cpu"]
 
     module_sizes = compute_module_sizes(model, dtype=dtype, special_dtypes=special_dtypes)
     tied_parameters = find_tied_parameters(model)
+
+    if check_tied_parameters_in_config(model) and len(tied_parameters) == 0:
+        logger.warn(
+            "The model weights are not tied. Please use the `tie_weights` method before using the `infer_auto_device` function."
+        )
 
     device_map = {}
     current_device = 0
@@ -734,8 +819,12 @@ def infer_auto_device_map(
                 current_memory_used += module_size_with_ties
                 device_map[name] = devices[current_device]
                 for tied_module_name in tied_module_names:
-                    tied_module_index = [i for i, (n, _) in enumerate(modules_to_treat) if n == tied_module_name][0]
-                    modules_to_treat.pop(tied_module_index)
+                    if tied_module_name in [m[0] for m in modules_to_treat]:
+                        # The module may have been removed by a previous iteration of this loop.
+                        tied_module_index = [i for i, (n, _) in enumerate(modules_to_treat) if n == tied_module_name][
+                            0
+                        ]
+                        modules_to_treat.pop(tied_module_index)
                     device_map[tied_module_name] = devices[current_device]
 
             else:
@@ -860,12 +949,11 @@ def load_state_dict(checkpoint_file, device_map=None):
         if device_map is None:
             return safe_load_file(checkpoint_file)
         else:
-            devices = list(set(device_map.values()) - {"disk"})
-
             # if we only have one device we can load everything directly
-            if len(devices) == 1:
-                return safe_load_file(checkpoint_file, device=devices[0])
+            if len(set(device_map.values())) == 1:
+                return safe_load_file(checkpoint_file, device=list(device_map.values())[0])
 
+            devices = list(set(device_map.values()) - {"disk"})
             # cpu device should always exist as fallback option
             if "cpu" not in devices:
                 devices.append("cpu")
@@ -950,6 +1038,14 @@ def load_checkpoint_in_model(
             Whether or not to include the buffers in the weights offloaded to disk.
     """
     tied_params = find_tied_parameters(model)
+
+    if check_tied_parameters_in_config(model) and len(tied_params) == 0:
+        logger.warn(
+            "The model weights are not tied. Please use the `tie_weights` method before using the `infer_auto_device` function."
+        )
+
+    check_tied_parameters_on_same_device(tied_params, device_map)
+
     if offload_folder is None and device_map is not None and "disk" in device_map.values():
         raise ValueError(
             "At least one of the model submodule will be offloaded to disk, please pass along an `offload_folder`."
