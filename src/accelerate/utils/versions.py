@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib.metadata
+import sys
+if sys.version_info < (3, 8):
+    import importlib
+    import importlib_metadata
+    importlib.metadata = importlib_metadata
+else:
+    import importlib.metadata as importlib_metadata
 from typing import Union
 
 from packaging.version import Version, parse

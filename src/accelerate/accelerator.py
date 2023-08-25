@@ -128,7 +128,8 @@ if is_megatron_lm_available():
         megatron_lm_prepare_scheduler,
     )
 
-from torch.distributed.algorithms.join import Join
+# torch 1.9 not support
+# from torch.distributed.algorithms.join import Join
 
 
 if is_tpu_available(check_device=False):

@@ -218,6 +218,7 @@ class DistributedType(str, enum.Enum):
     NO = "NO"
     MULTI_CPU = "MULTI_CPU"
     MULTI_GPU = "MULTI_GPU"
+    MULTI_MLU = "MULTI_MLU"
     MULTI_NPU = "MULTI_NPU"
     MULTI_XPU = "MULTI_XPU"
     DEEPSPEED = "DEEPSPEED"

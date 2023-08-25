@@ -293,12 +293,12 @@ def set_module_tensor_to_device(
 
     device_quantization = None
     with torch.no_grad():
-        # leave it on cpu first before moving them to cuda
+        # leave it on cpu first before moving them to mlu
         # # fix the case where the device is meta, we don't want to put it on cpu because there is no data =0
         if (
             param is not None
-            and param.device.type != "cuda"
-            and torch.device(device).type == "cuda"
+            and param.device.type != "mlu"
+            and torch.device(device).type == "mlu"
             and param_cls.__name__ in ["Int8Params", "FP4Params"]
         ):
             device_quantization = device
@@ -344,21 +344,21 @@ def set_module_tensor_to_device(
                 and str(module.weight.device) != "meta"
             ):
                 # quantize only if necessary
-                device_index = torch.device(device).index if torch.device(device).type == "cuda" else None
+                device_index = torch.device(device).index if torch.device(device).type == "mlu" else None
                 if not getattr(module.weight, "SCB", None) and device_index is not None:
                     if module.bias is not None and module.bias.device.type != "meta":
                         # if a bias exists, we need to wait until the bias is set on the correct device
-                        module = module.cuda(device_index)
+                        module = module.mlu(device_index)
                     elif module.bias is None:
                         # if no bias exists, we can quantize right away
-                        module = module.cuda(device_index)
+                        module = module.mlu(device_index)
             elif module.__class__.__name__ == "Linear4bit" and getattr(module.weight, "quant_state", None) is None:
                 # quantize only if necessary
-                device_index = torch.device(device).index if torch.device(device).type == "cuda" else None
+                device_index = torch.device(device).index if torch.device(device).type == "mlu" else None
                 if not getattr(module.weight, "quant_state", None) and device_index is not None:
-                    module.weight = module.weight.cuda(device_index)
+                    module.weight = module.weight.mlu(device_index)
     # clean pre and post foward hook
-    torch.cuda.empty_cache()
+    torch.mlu.empty_cache()
 
 
 def named_module_tensors(module: nn.Module, include_buffers: bool = True, recurse: bool = False):
@@ -640,11 +640,11 @@ def get_max_memory(max_memory: Optional[Dict[Union[int, str], Union[int, str]]] 
             max_memory = {}
 
         else:
-            # Make sure CUDA is initialized on each GPU to have the right memory info.
+            # Make sure mlu is initialized on each GPU to have the right memory info.
             if not is_xpu_available():
-                for i in range(torch.cuda.device_count()):
+                for i in range(torch.mlu.device_count()):
                     _ = torch.tensor([0], device=i)
-                # max_memory = {i: torch.cuda.mem_get_info(i)[0] for i in range(torch.cuda.device_count())}
+                # max_memory = {i: torch.mlu.mem_get_info(i)[0] for i in range(torch.mlu.device_count())}
                 max_memory = {i: mlu_mem_get_info(i)[0] for i in range(torch.mlu.device_count())}
             else:
                 for i in range(torch.xpu.device_count()):
@@ -666,7 +666,7 @@ def get_max_memory(max_memory: Optional[Dict[Union[int, str], Union[int, str]]] 
     gpu_devices = [k for k in max_memory.keys() if isinstance(k, int)]
     gpu_devices.sort()
     # check if gpu/xgpu devices are available and if not, throw a warning
-    num_devices = torch.xpu.device_count() if is_xpu_available() else torch.cuda.device_count()
+    num_devices = torch.xpu.device_count() if is_xpu_available() else torch.mlu.device_count()
     for device in gpu_devices:
         if device >= num_devices or device < 0:
             logger.warning(f"Device {device} is not available, available devices are {list(range(num_devices))}")

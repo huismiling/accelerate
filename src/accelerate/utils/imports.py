@@ -13,7 +13,14 @@
 # limitations under the License.
 
 import importlib
-import importlib.metadata
+# The package importlib_metadata is in a different place, depending on the Python version.
+import sys
+if sys.version_info < (3, 8):
+    import importlib_metadata
+    importlib.metadata = importlib_metadata
+else:
+    import importlib.metadata as importlib_metadata
+
 import os
 import warnings
 from distutils.util import strtobool
@@ -90,7 +97,7 @@ def is_cuda_available():
     return available
 
 
-@lru_cache
+# @lru_cache
 def is_tpu_available(check_device=True):
     "Checks if `torch_xla` is installed and potentially if a TPU is in the environment"
     # Due to bugs on the amp series GPUs, we disable torch-xla on them
@@ -256,7 +263,7 @@ def is_ipex_available():
     return True
 
 
-@lru_cache
+# @lru_cache
 def is_npu_available(check_device=False):
     "Checks if `torch_npu` is installed and potentially if a NPU is in the environment"
     if importlib.util.find_spec("torch") is None or importlib.util.find_spec("torch_npu") is None:
@@ -275,7 +282,7 @@ def is_npu_available(check_device=False):
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
-@lru_cache
+# @lru_cache
 def is_xpu_available(check_device=False):
     "check if user disables it explicitly"
     if not parse_flag_from_env("ACCELERATE_USE_XPU", default=True):

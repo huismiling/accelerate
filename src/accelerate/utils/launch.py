@@ -38,8 +38,7 @@ def _filter_args(args, parser, default_args=[]):
     """
     Filters out all `accelerate` specific args
     """
-    if is_torch_version(">=", "1.9.0"):
-        import torch.distributed.run as distrib_run
+    import torch.distributed.run as distrib_run
     distrib_args = distrib_run.get_args_parser()
 
     # fix torch==1.9.0
