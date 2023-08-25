@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import contextlib
-import enum
 import gc
 import inspect
 import json
@@ -29,8 +28,9 @@ import torch
 import torch.nn as nn
 
 from ..state import AcceleratorState
-from .dataclasses import DistributedType
-from .imports import is_mps_available, is_safetensors_available, is_torch_version, is_xpu_available
+from .constants import SAFE_WEIGHTS_NAME, WEIGHTS_NAME
+from .dataclasses import AutocastKwargs, CustomDtype, DistributedType
+from .imports import is_mps_available, is_npu_available, is_safetensors_available, is_xpu_available
 from .offload import load_offloaded_weight, offload_weight, save_offload_index
 from .tqdm import is_tqdm_available, tqdm
 
@@ -43,14 +43,6 @@ WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
 
 
 logger = logging.getLogger(__name__)
-
-
-class CustomDtype(enum.Enum):
-    r"""
-    An enum that contains multiple custom dtypes that can be used for `infer_auto_device_map`.
-    """
-    FP8 = "fp8"
-    INT4 = "int4"
 
 
 def convert_file_size_to_int(size: Union[int, str]):
@@ -67,24 +59,34 @@ def convert_file_size_to_int(size: Union[int, str]):
     1048576
     ```
     """
-    if isinstance(size, int):
-        return size
-    if size.upper().endswith("GIB"):
-        return int(size[:-3]) * (2**30)
-    if size.upper().endswith("MIB"):
-        return int(size[:-3]) * (2**20)
-    if size.upper().endswith("KIB"):
-        return int(size[:-3]) * (2**10)
-    if size.upper().endswith("GB"):
-        int_size = int(size[:-2]) * (10**9)
-        return int_size // 8 if size.endswith("b") else int_size
-    if size.upper().endswith("MB"):
-        int_size = int(size[:-2]) * (10**6)
-        return int_size // 8 if size.endswith("b") else int_size
-    if size.upper().endswith("KB"):
-        int_size = int(size[:-2]) * (10**3)
-        return int_size // 8 if size.endswith("b") else int_size
-    raise ValueError("`size` is not in a valid format. Use an integer followed by the unit, e.g., '5GB'.")
+    mem_size = 0
+    err_msg = (
+        f"`size` {size} is not in a valid format. Use an integer for bytes, or a string with an unit (like '5.0GB')."
+    )
+    try:
+        if isinstance(size, int):
+            mem_size = size
+        elif size.upper().endswith("GIB"):
+            mem_size = int(float(size[:-3]) * (2**30))
+        elif size.upper().endswith("MIB"):
+            mem_size = int(float(size[:-3]) * (2**20))
+        elif size.upper().endswith("KIB"):
+            mem_size = int(float(size[:-3]) * (2**10))
+        elif size.upper().endswith("GB"):
+            int_size = int(float(size[:-2]) * (10**9))
+            mem_size = int_size // 8 if size.endswith("b") else int_size
+        elif size.upper().endswith("MB"):
+            int_size = int(float(size[:-2]) * (10**6))
+            mem_size = int_size // 8 if size.endswith("b") else int_size
+        elif size.upper().endswith("KB"):
+            int_size = int(float(size[:-2]) * (10**3))
+            mem_size = int_size // 8 if size.endswith("b") else int_size
+    except ValueError:
+        raise ValueError(err_msg)
+
+    if mem_size <= 0:
+        raise ValueError(err_msg)
+    return mem_size
 
 
 def dtype_byte_size(dtype: torch.dtype):
@@ -111,12 +113,131 @@ def dtype_byte_size(dtype: torch.dtype):
     return bit_size // 8
 
 
+def id_tensor_storage(tensor: torch.Tensor) -> Tuple[torch.device, int, int]:
+    """
+    Unique identifier to a tensor storage. Multiple different tensors can share the same underlying storage. For
+    example, "meta" tensors all share the same storage, and thus their identifier will all be equal. This identifier is
+    guaranteed to be unique and constant for this tensor's storage during its lifetime. Two tensor storages with
+    non-overlapping lifetimes may have the same id.
+    """
+    _SIZE = {
+        torch.int64: 8,
+        torch.float32: 4,
+        torch.int32: 4,
+        torch.bfloat16: 2,
+        torch.float16: 2,
+        torch.int16: 2,
+        torch.uint8: 1,
+        torch.int8: 1,
+        torch.bool: 1,
+        torch.float64: 8,
+    }
+    try:
+        storage_ptr = tensor.untyped_storage().data_ptr()
+        storage_size = tensor.untyped_storage().nbytes()
+    except Exception:
+        # Fallback for torch==1.10
+        try:
+            storage_ptr = tensor.storage().data_ptr()
+            storage_size = tensor.storage().size() * _SIZE[tensor.dtype]
+        except NotImplementedError:
+            # Fallback for meta storage
+            storage_ptr = 0
+            # On torch >=2.0 this is the tensor size
+            storage_size = tensor.nelement() * _SIZE[tensor.dtype]
+
+    return tensor.device, storage_ptr, storage_size
+
+
+def shard_checkpoint(
+    state_dict: Dict[str, torch.Tensor], max_shard_size: Union[int, str] = "10GB", weights_name: str = WEIGHTS_NAME
+):
+    """
+    Splits a model state dictionary in sub-checkpoints so that the final size of each sub-checkpoint does not exceed a
+    given size.
+
+    The sub-checkpoints are determined by iterating through the `state_dict` in the order of its keys, so there is no
+    optimization made to make each sub-checkpoint as close as possible to the maximum size passed. For example, if the
+    limit is 10GB and we have weights of sizes [6GB, 6GB, 2GB, 6GB, 2GB, 2GB] they will get sharded as [6GB], [6+2GB],
+    [6+2+2GB] and not [6+2+2GB], [6+2GB], [6GB].
+
+    <Tip warning={true}>
+
+    If one of the model's weight is bigger that `max_sahrd_size`, it will end up in its own sub-checkpoint which will
+    have a size greater than `max_shard_size`.
+
+    </Tip>
+
+    Args:
+        state_dict (`Dict[str, torch.Tensor]`): The state dictionary of a model to save.
+        max_shard_size (`int` or `str`, *optional*, defaults to `"10GB"`):
+            The maximum size of each sub-checkpoint. If expressed as a string, needs to be digits followed by a unit
+            (like `"5MB"`).
+        weights_name (`str`, *optional*, defaults to `"pytorch_model.bin"`):
+            The name of the model save file.
+    """
+    max_shard_size = convert_file_size_to_int(max_shard_size)
+
+    sharded_state_dicts = [{}]
+    last_block_size = 0
+    total_size = 0
+    storage_id_to_block = {}
+
+    for key, weight in state_dict.items():
+        # when bnb serialization is used the weights in the state dict can be strings
+        # check: https://github.com/huggingface/transformers/pull/24416 for more details
+        if isinstance(weight, str):
+            continue
+        else:
+            storage_id = id_tensor_storage(weight)
+
+        # If a `weight` shares the same underlying storage as another tensor, we put `weight` in the same `block`
+        if storage_id in storage_id_to_block:
+            block_id = storage_id_to_block[storage_id]
+            sharded_state_dicts[block_id][key] = weight
+            continue
+
+        weight_size = weight.numel() * dtype_byte_size(weight.dtype)
+
+        # If this weight is going to tip up over the maximal size, we split.
+        if last_block_size + weight_size > max_shard_size:
+            sharded_state_dicts.append({})
+            last_block_size = 0
+
+        sharded_state_dicts[-1][key] = weight
+        last_block_size += weight_size
+        total_size += weight_size
+        storage_id_to_block[storage_id] = len(sharded_state_dicts) - 1
+
+    # If we only have one shard, we return it
+    if len(sharded_state_dicts) == 1:
+        return {weights_name: sharded_state_dicts[0]}, None
+
+    # Otherwise, let's build the index
+    weight_map = {}
+    shards = {}
+    for idx, shard in enumerate(sharded_state_dicts):
+        shard_file = weights_name.replace(".bin", f"-{idx+1:05d}-of-{len(sharded_state_dicts):05d}.bin")
+        shard_file = shard_file.replace(
+            ".safetensors", f"-{idx + 1:05d}-of-{len(sharded_state_dicts):05d}.safetensors"
+        )
+        shards[shard_file] = shard
+        for key in shard.keys():
+            weight_map[key] = shard_file
+
+    # Add the metadata
+    metadata = {"total_size": total_size}
+    index = {"metadata": metadata, "weight_map": weight_map}
+    return shards, index
+
+
 def set_module_tensor_to_device(
     module: nn.Module,
     tensor_name: str,
     device: Union[int, str, torch.device],
     value: Optional[torch.Tensor] = None,
     dtype: Optional[Union[str, torch.dtype]] = None,
+    fp16_statistics: Optional[torch.HalfTensor] = None,
 ):
     """
     A helper function to set a given tensor (parameter of buffer) of a module on a specific device (note that doing
@@ -134,6 +255,8 @@ def set_module_tensor_to_device(
         dtype (`torch.dtype`, *optional*):
             If passed along the value of the parameter will be cast to this `dtype`. Otherwise, `value` will be cast to
             the dtype of the existing parameter in the model.
+        fp16_statistics (`torch.HalfTensor`, *optional*):
+            The list of fp16 statistics to set on the module, used for 8 bit model serialization.
     """
     # Recurse if needed
     if "." in tensor_name:
@@ -154,20 +277,44 @@ def set_module_tensor_to_device(
         raise ValueError(f"{tensor_name} is on the meta device, we need a `value` to put in on {device}.")
 
     if value is not None:
+        if old_value.shape != value.shape:
+            raise ValueError(
+                f'Trying to set a tensor of shape {value.shape} in "{tensor_name}" (which has shape {old_value.shape}), this look incorrect.'
+            )
+
         if dtype is None:
             # For compatibility with PyTorch load_state_dict which converts state dict dtype to existing dtype in model
             value = value.to(old_value.dtype)
         elif not str(value.dtype).startswith(("torch.uint", "torch.int", "torch.bool")):
             value = value.to(dtype)
 
+    param = module._parameters[tensor_name] if tensor_name in module._parameters else None
+    param_cls = type(param)
+
+    device_quantization = None
     with torch.no_grad():
+        # leave it on cpu first before moving them to cuda
+        # # fix the case where the device is meta, we don't want to put it on cpu because there is no data =0
+        if (
+            param is not None
+            and param.device.type != "cuda"
+            and torch.device(device).type == "cuda"
+            and param_cls.__name__ in ["Int8Params", "FP4Params"]
+        ):
+            device_quantization = device
+            device = "cpu"
         if value is None:
             new_value = old_value.to(device)
+            if dtype is not None and device in ["meta", torch.device("meta")]:
+                new_value = new_value.to(dtype)
+                if not is_buffer:
+                    module._parameters[tensor_name] = param_cls(new_value, requires_grad=old_value.requires_grad)
         elif isinstance(value, torch.Tensor):
             new_value = value.to(device)
         else:
             new_value = torch.tensor(value, device=device)
-
+        if device_quantization is not None:
+            device = device_quantization
         if is_buffer:
             module._buffers[tensor_name] = new_value
         elif value is not None or torch.device(device) != module._parameters[tensor_name].device:
@@ -177,12 +324,25 @@ def set_module_tensor_to_device(
                 if param_cls.__name__ == "Int8Params" and new_value.dtype == torch.float32:
                     # downcast to fp16 if any - needed for 8bit serialization
                     new_value = new_value.to(torch.float16)
-                new_value = param_cls(new_value, requires_grad=old_value.requires_grad, **kwargs).to(device)
+                # quantize module that are going to stay on the cpu so that we offload quantized weights
+                if device == "cpu" and param_cls.__name__ == "Int8Params":
+                    new_value = param_cls(new_value, requires_grad=old_value.requires_grad, **kwargs).to(0).to("cpu")
+                    new_value.CB = new_value.CB.to("cpu")
+                    new_value.SCB = new_value.SCB.to("cpu")
+                else:
+                    new_value = param_cls(new_value, requires_grad=old_value.requires_grad, **kwargs).to(device)
             else:
                 new_value = param_cls(new_value, requires_grad=old_value.requires_grad).to(device)
             module._parameters[tensor_name] = new_value
-
-            if module.__class__.__name__ == "Linear8bitLt" and getattr(module.weight, "SCB", None) is None:
+            if fp16_statistics is not None:
+                setattr(module._parameters[tensor_name], "SCB", fp16_statistics.to(device))
+                del fp16_statistics
+            # as we put the weight to meta, it doesn't have SCB attr anymore. make sure that it is not a meta weight
+            if (
+                module.__class__.__name__ == "Linear8bitLt"
+                and getattr(module.weight, "SCB", None) is None
+                and str(module.weight.device) != "meta"
+            ):
                 # quantize only if necessary
                 device_index = torch.device(device).index if torch.device(device).type == "cuda" else None
                 if not getattr(module.weight, "SCB", None) and device_index is not None:
@@ -197,6 +357,8 @@ def set_module_tensor_to_device(
                 device_index = torch.device(device).index if torch.device(device).type == "cuda" else None
                 if not getattr(module.weight, "quant_state", None) and device_index is not None:
                     module.weight = module.weight.cuda(device_index)
+    # clean pre and post foward hook
+    torch.cuda.empty_cache()
 
 
 def named_module_tensors(module: nn.Module, include_buffers: bool = True, recurse: bool = False):
@@ -498,6 +660,26 @@ def get_max_memory(max_memory: Optional[Dict[Union[int, str], Union[int, str]]] 
     for key in max_memory:
         if isinstance(max_memory[key], str):
             max_memory[key] = convert_file_size_to_int(max_memory[key])
+
+    # Need to sort the device by type to make sure that we allocate the gpu first.
+    # As gpu/xpu are represented by int, we need to sort them first.
+    gpu_devices = [k for k in max_memory.keys() if isinstance(k, int)]
+    gpu_devices.sort()
+    # check if gpu/xgpu devices are available and if not, throw a warning
+    num_devices = torch.xpu.device_count() if is_xpu_available() else torch.cuda.device_count()
+    for device in gpu_devices:
+        if device >= num_devices or device < 0:
+            logger.warning(f"Device {device} is not available, available devices are {list(range(num_devices))}")
+    # Add the other devices in the preset order if they are available
+    all_devices = gpu_devices + [k for k in ["mps", "cpu", "disk"] if k in max_memory.keys()]
+    # Raise an error if a device is not recognized
+    for k in max_memory.keys():
+        if k not in all_devices:
+            raise ValueError(
+                f"Device {k} is not recognized, available devices are integers(for GPU/XPU), 'mps', 'cpu' and 'disk'"
+            )
+    max_memory = {k: max_memory[k] for k in all_devices}
+
     return max_memory
 
 
@@ -539,11 +721,18 @@ def load_offloaded_weights(model, index, offload_folder):
     if index is None or len(index) == 0:
         # Nothing to do
         return
-
     for param_name, metadata in index.items():
+        if "SCB" in param_name:
+            continue
+        fp16_statistics = None
+        if "weight" in param_name and param_name.replace("weight", "SCB") in index.keys():
+            weight_name = param_name.replace("weight", "SCB")
+            fp16_statistics = load_offloaded_weight(
+                os.path.join(offload_folder, f"{weight_name}.dat"), index[weight_name]
+            )
         tensor_file = os.path.join(offload_folder, f"{param_name}.dat")
         weight = load_offloaded_weight(tensor_file, metadata)
-        set_module_tensor_to_device(model, param_name, "cpu", value=weight)
+        set_module_tensor_to_device(model, param_name, "cpu", value=weight, fp16_statistics=fp16_statistics)
 
 
 def get_balanced_memory(
@@ -582,6 +771,7 @@ def get_balanced_memory(
             Transformers generate function).
     """
     # Get default / clean up max_memory
+    user_not_set_max_memory = max_memory is None
     max_memory = get_max_memory(max_memory)
 
     if not (torch.mlu.is_available() or is_xpu_available()) or is_mps_available():
@@ -590,7 +780,31 @@ def get_balanced_memory(
     if not is_xpu_available():
         num_devices = len([d for d in max_memory if torch.device(d).type == "mlu" and max_memory[d] > 0])
     else:
-        num_devices = len([d for d in max_memory if torch.device(d).type == "xpu" and max_memory[d] > 0])
+        num_devices = len(
+            [
+                d
+                for d in max_memory
+                if (
+                    d != "cpu"
+                    and (torch.device(d).type == "xpu" or torch.xpu.get_device_properties(d).dev_type == "gpu")
+                )
+                and max_memory[d] > 0
+            ]
+        )
+
+    if num_devices == 1:
+        # We cannot do low_zero on just one GPU, but we will still reserve some memory for the buffer
+        low_zero = False
+        # If user just asked us to handle memory usage, we should avoid OOM
+        if user_not_set_max_memory:
+            for key in max_memory.keys():
+                if isinstance(key, int):
+                    max_memory[key] *= 0.9  # 90% is a good compromise
+                    logger.info(
+                        f"We will use 90% of the memory on device {key} for storing the model, and 10% for the buffer to avoid OOM. "
+                        "You can set `max_memory` in to a higher value to use more memory (at your own risk)."
+                    )
+                    break  # only one device
 
     module_sizes = compute_module_sizes(model, dtype=dtype, special_dtypes=special_dtypes)
     per_gpu = module_sizes[""] // (num_devices - 1 if low_zero else num_devices)
@@ -633,17 +847,39 @@ def get_balanced_memory(
     buffer = int(1.25 * max(buffer, mean_leaves))
     per_gpu += buffer
 
-    max_memory = get_max_memory(max_memory)
-    last_gpu = max(i for i in max_memory if isinstance(i, int) and max_memory[i] > 0)
+    # Sorted list of GPUs id (we may have some gpu ids not included in the our max_memory list - let's ignore them)
+    gpus_idx_list = list(
+        sorted(
+            device_id for device_id, device_mem in max_memory.items() if isinstance(device_id, int) and device_mem > 0
+        )
+    )
     # The last device is left with max_memory just in case the buffer is not enough.
-    for i in range(last_gpu):
-        max_memory[i] = min(0 if low_zero and i == 0 else per_gpu, max_memory[i])
+    for idx in gpus_idx_list[:-1]:
+        max_memory[idx] = min(max_memory[0] if low_zero and idx == 0 else per_gpu, max_memory[idx])
 
     if low_zero:
         min_zero = max(0, module_sizes[""] - sum([max_memory[i] for i in range(1, num_devices)]))
         max_memory[0] = min(min_zero, max_memory[0])
 
     return max_memory
+
+
+def calculate_maximum_sizes(model: torch.nn.Module):
+    "Computes the total size of the model and its largest layer"
+    sizes = compute_module_sizes(model)
+    # `transformers` models store this information for us
+    no_split_modules = getattr(model, "_no_split_modules", None)
+    if no_split_modules is None:
+        no_split_modules = []
+
+    modules_to_treat = (
+        list(model.named_parameters(recurse=False))
+        + list(model.named_children())
+        + list(model.named_buffers(recurse=False))
+    )
+    largest_layer = get_max_layer_size(modules_to_treat, sizes, no_split_modules)
+    total_size = sizes[""]
+    return total_size, largest_layer
 
 
 def infer_auto_device_map(
@@ -695,9 +931,9 @@ def infer_auto_device_map(
         no_split_module_classes = [no_split_module_classes]
 
     devices = list(max_memory.keys())
-    gpus = [device for device in devices if device != "cpu"]
     if "disk" not in devices:
         devices.append("disk")
+    gpus = [device for device in devices if device not in ["cpu", "disk"]]
 
     # Devices that need to keep space for a potential offloaded layer.
     if "mps" in gpus:
@@ -993,7 +1229,7 @@ def load_state_dict(checkpoint_file, device_map=None):
 
             return tensors
     else:
-        return torch.load(checkpoint_file)
+        return torch.load(checkpoint_file, map_location=torch.device("cpu"))
 
 
 def load_checkpoint_in_model(
@@ -1004,6 +1240,8 @@ def load_checkpoint_in_model(
     dtype: Optional[Union[str, torch.dtype]] = None,
     offload_state_dict: bool = False,
     offload_buffers: bool = False,
+    keep_in_fp32_modules: List[str] = None,
+    offload_8bit_bnb: bool = False,
 ):
     """
     Loads a (potentially sharded) checkpoint inside a model, potentially sending weights to a given device as they are
@@ -1024,6 +1262,7 @@ def load_checkpoint_in_model(
             - a path to a file containing a whole model state dict
             - a path to a `.json` file containing the index to a sharded checkpoint
             - a path to a folder containing a unique `.index.json` file and the shards of a checkpoint.
+            - a path to a folder containing a unique pytorch_model.bin or a model.safetensors file.
         device_map (`Dict[str, Union[int, str, torch.device]]`, *optional*):
             A map that specifies where each submodule should go. It doesn't need to be refined to each parameter/buffer
             name, once a given module name is inside, every submodule of it will be sent to the same device.
@@ -1034,9 +1273,17 @@ def load_checkpoint_in_model(
         offload_state_dict (`bool`, *optional*, defaults to `False`):
             If `True`, will temporarily offload the CPU state dict on the hard drive to avoid getting out of CPU RAM if
             the weight of the CPU state dict + the biggest shard does not fit.
-        offload_buffers (`bool`, *optional*, defaults to `False):
+        offload_buffers (`bool`, *optional*, defaults to `False`):
             Whether or not to include the buffers in the weights offloaded to disk.
+        keep_in_fp32_modules(`List[str]`, *optional*):
+            A list of the modules that we keep in `torch.float32` dtype.
+        offload_8bit_bnb (`bool`, *optional*):
+            Whether or not to enable offload of 8-bit modules on cpu/disk.
+
     """
+    if offload_8bit_bnb:
+        from .bnb import quantize_and_offload_8bit
+
     tied_params = find_tied_parameters(model)
 
     if check_tied_parameters_in_config(model) and len(tied_params) == 0:
@@ -1066,17 +1313,30 @@ def load_checkpoint_in_model(
         else:
             checkpoint_files = [checkpoint]
     elif os.path.isdir(checkpoint):
-        potential_index = [f for f in os.listdir(checkpoint) if f.endswith(".index.json")]
-        if len(potential_index) == 0:
-            raise ValueError(f"{checkpoint} is not a folder containing a `.index.json` file.")
-        elif len(potential_index) == 1:
-            index_filename = os.path.join(checkpoint, potential_index[0])
+        # check if the whole state dict is present
+        potential_state_bin = [f for f in os.listdir(checkpoint) if f == WEIGHTS_NAME]
+        potential_state_safetensor = [f for f in os.listdir(checkpoint) if f == SAFE_WEIGHTS_NAME]
+        if len(potential_state_bin) == 1:
+            checkpoint_files = [os.path.join(checkpoint, potential_state_bin[0])]
+        elif len(potential_state_safetensor) == 1:
+            checkpoint_files = [os.path.join(checkpoint, potential_state_safetensor[0])]
         else:
-            raise ValueError(f"{checkpoint} containing more than one `.index.json` file, delete the irrelevant ones.")
+            # otherwise check for sharded checkpoints
+            potential_index = [f for f in os.listdir(checkpoint) if f.endswith(".index.json")]
+            if len(potential_index) == 0:
+                raise ValueError(
+                    f"{checkpoint} is not a folder containing a `.index.json` file or a {WEIGHTS_NAME} or a {SAFE_WEIGHTS_NAME} file"
+                )
+            elif len(potential_index) == 1:
+                index_filename = os.path.join(checkpoint, potential_index[0])
+            else:
+                raise ValueError(
+                    f"{checkpoint} containing more than one `.index.json` file, delete the irrelevant ones."
+                )
     else:
         raise ValueError(
             "`checkpoint` should be the path to a file containing a whole state dict, or the index of a sharded "
-            f"checkpoint, or a folder containing a sharded checkpoint, but got {checkpoint}."
+            f"checkpoint, or a folder containing a sharded checkpoint or the whole state dict, but got {checkpoint}."
         )
 
     if index_filename is not None:
@@ -1097,13 +1357,16 @@ def load_checkpoint_in_model(
         state_dict_index = {}
 
     buffer_names = [name for name, _ in model.named_buffers()]
-
     for checkpoint_file in checkpoint_files:
         checkpoint = load_state_dict(checkpoint_file, device_map=device_map)
         if device_map is None:
             model.load_state_dict(checkpoint, strict=False)
         else:
             for param_name, param in checkpoint.items():
+                # skip SCB parameter (for 8-bit serialization)
+                if "SCB" in param_name:
+                    continue
+
                 module_name = param_name
 
                 while len(module_name) > 0 and module_name not in device_map:
@@ -1112,16 +1375,54 @@ def load_checkpoint_in_model(
                     # TODO: group all errors and raise at the end.
                     raise ValueError(f"{param_name} doesn't have any device set.")
                 param_device = device_map[module_name]
+                new_dtype = dtype
+                if dtype is not None and torch.is_floating_point(param):
+                    if keep_in_fp32_modules is not None and dtype == torch.float16:
+                        proceed = False
+                        for key in keep_in_fp32_modules:
+                            if ((key in param_name) and (key + "." in param_name)) or key == param_name:
+                                proceed = True
+                                break
+                        if proceed:
+                            new_dtype = torch.float32
+
+                if "weight" in param_name and param_name.replace("weight", "SCB") in checkpoint.keys():
+                    if param.dtype == torch.int8:
+                        fp16_statistics = checkpoint[param_name.replace("weight", "SCB")]
+                else:
+                    fp16_statistics = None
 
                 if param_device == "disk":
                     if offload_buffers or param_name not in buffer_names:
-                        set_module_tensor_to_device(model, param_name, "meta")
-                    offload_weight(param, param_name, offload_folder, index=offload_index)
+                        if new_dtype is None:
+                            new_dtype = param.dtype
+                        if offload_8bit_bnb:
+                            quantize_and_offload_8bit(
+                                model, param, param_name, new_dtype, offload_folder, offload_index, fp16_statistics
+                            )
+                            continue
+                        else:
+                            set_module_tensor_to_device(model, param_name, "meta", dtype=new_dtype)
+                        offload_weight(param, param_name, offload_folder, index=offload_index)
                 elif param_device == "cpu" and offload_state_dict:
-                    set_module_tensor_to_device(model, param_name, "meta")
-                    offload_weight(param, param_name, state_dict_folder, index=state_dict_index)
+                    if new_dtype is None:
+                        new_dtype = param.dtype
+                    if offload_8bit_bnb:
+                        quantize_and_offload_8bit(
+                            model, param, param_name, new_dtype, state_dict_folder, state_dict_index, fp16_statistics
+                        )
+                    else:
+                        set_module_tensor_to_device(model, param_name, "meta", dtype=new_dtype)
+                        offload_weight(param, param_name, state_dict_folder, index=state_dict_index)
                 else:
-                    set_module_tensor_to_device(model, param_name, param_device, value=param, dtype=dtype)
+                    set_module_tensor_to_device(
+                        model,
+                        param_name,
+                        param_device,
+                        value=param,
+                        dtype=new_dtype,
+                        fp16_statistics=fp16_statistics,
+                    )
 
         # Force Python to clean up.
         del checkpoint
@@ -1137,7 +1438,7 @@ def load_checkpoint_in_model(
     retie_parameters(model, tied_params)
 
 
-def get_mixed_precision_context_manager(native_amp: bool = False, cache_enabled: bool = True):
+def get_mixed_precision_context_manager(native_amp: bool = False, autocast_kwargs: AutocastKwargs = None):
     """
     Return a context manager for autocasting mixed precision
 
@@ -1148,17 +1449,24 @@ def get_mixed_precision_context_manager(native_amp: bool = False, cache_enabled:
             Whether the weight cache inside autocast should be enabled.
     """
     state = AcceleratorState()
+    if autocast_kwargs is None:
+        autocast_kwargs = {}
+    else:
+        autocast_kwargs = autocast_kwargs.to_kwargs()
     if native_amp:
-        if state.mixed_precision == "fp16" and is_torch_version(">=", "1.10"):
-            return torch.autocast(device_type=state.device.type, dtype=torch.float16, cache_enabled=cache_enabled)
+        if state.mixed_precision == "fp16":
+            if is_npu_available():
+                return torch.npu.amp.autocast(dtype=torch.float16, **autocast_kwargs)
+            else:
+                return torch.autocast(device_type=state.device.type, dtype=torch.float16, **autocast_kwargs)
         elif state.mixed_precision == "bf16" and state.distributed_type in [
             DistributedType.NO,
             DistributedType.MULTI_CPU,
             DistributedType.MULTI_GPU,
             DistributedType.MULTI_XPU,
         ]:
-            return torch.autocast(device_type=state.device.type, dtype=torch.bfloat16, cache_enabled=cache_enabled)
+            return torch.autocast(device_type=state.device.type, dtype=torch.bfloat16, **autocast_kwargs)
         else:
-            return torch.autocast(device_type=state.device.type, cache_enabled=cache_enabled)
+            return torch.autocast(device_type=state.device.type, **autocast_kwargs)
     else:
         return contextlib.nullcontext()

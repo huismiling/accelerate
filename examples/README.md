@@ -51,13 +51,13 @@ To run it in each of these various modes, use the following commands:
     python ./nlp_example.py  # from a server with a GPU
     ```
 - with fp16 (mixed-precision)
-    * from any server by passing `fp16=True` to the `Accelerator`.
+    * from any server by passing `mixed_precison=fp16` to the `Accelerator`.
         ```bash
-        python ./nlp_example.py --fp16
+        python ./nlp_example.py --mixed_precision fp16
         ```
     * from any server with Accelerate launcher
         ```bash
-        accelerate launch --fp16 ./nlp_example.py
+        accelerate launch --mixed_precision fp16 ./nlp_example.py
 - multi GPUs (using PyTorch distributed mode)
     * With Accelerate config and launcher
         ```bash
@@ -139,13 +139,13 @@ To run it in each of these various modes, use the following commands:
     python ./cv_example.py  # from a server with a GPU
     ```
 - with fp16 (mixed-precision)
-    * from any server by passing `fp16=True` to the `Accelerator`.
+    * from any server by passing `mixed_precison=fp16` to the `Accelerator`.
         ```bash
-        python ./cv_example.py --data_dir path_to_data --fp16
+        python ./cv_example.py --data_dir path_to_data --mixed_precison fp16
         ```
     * from any server with Accelerate launcher
         ```bash
-        accelerate launch --fp16 ./cv_example.py --data_dir path_to_data
+        accelerate launch --mixed_precison fp16 ./cv_example.py --data_dir path_to_data
 - multi GPUs (using PyTorch distributed mode)
     * With Accelerate config and launcher
         ```bash
@@ -202,7 +202,7 @@ run the script to automatically launch multi GPU training on remote hardware.
 This script uses [Runhouse](https://github.com/run-house/runhouse) to launch on self-hosted hardware (e.g. in your own
 cloud account or on-premise cluster) but there are other options for running remotely as well. Runhouse can be installed
 with `pip install runhouse`, and you can refer to
-[hardware setup](https://runhouse-docs.readthedocs-hosted.com/en/main/rh_primitives/cluster.html#hardware-setup)
+[hardware setup](https://runhouse-docs.readthedocs-hosted.com/en/latest/api/python/cluster.html#hardware-setup)
 for hardware setup instructions, or this
 [Colab tutorial](https://colab.research.google.com/drive/1qVwYyLTCPYPSdz9ZX7BZl9Qm0A3j7RJe) for a more in-depth walkthrough.
 

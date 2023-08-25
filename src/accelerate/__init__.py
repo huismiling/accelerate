@@ -1,4 +1,4 @@
-__version__ = "0.21.0.dev0"
+__version__ = "0.23.0.dev0"
 
 from .accelerator import Accelerator
 from .big_modeling import (
@@ -14,6 +14,7 @@ from .data_loader import skip_first_batches
 from .launchers import debug_launcher, notebook_launcher
 from .state import PartialState
 from .utils import (
+    AutocastKwargs,
     DeepSpeedPlugin,
     DistributedDataParallelKwargs,
     DistributedType,

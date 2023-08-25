@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from accelerate import Accelerator
 from accelerate.test_utils import execute_subprocess_async, require_cuda
-from accelerate.utils import ProjectConfiguration, get_launch_prefix, set_seed
+from accelerate.utils import ProjectConfiguration, set_seed
 
 
 logger = logging.getLogger(__name__)
@@ -238,6 +238,35 @@ class CheckpointTest(unittest.TestCase):
             accelerator.load_state(os.path.join(tmpdir, "checkpoints", "checkpoint_0"))
             self.assertEqual(scheduler_state, scheduler.state_dict())
 
+    def test_automatic_loading(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_seed(42)
+            model = DummyModel()
+            optimizer = torch.optim.Adam(params=model.parameters(), lr=1e-3)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.99)
+            train_dataloader, valid_dataloader = dummy_dataloaders()
+            project_config = ProjectConfiguration(automatic_checkpoint_naming=True)
+            # Train baseline
+            accelerator = Accelerator(project_dir=tmpdir, project_config=project_config)
+            model, optimizer, train_dataloader, valid_dataloader, scheduler = accelerator.prepare(
+                model, optimizer, train_dataloader, valid_dataloader, scheduler
+            )
+            # Save initial
+            accelerator.save_state()
+            train(2, model, train_dataloader, optimizer, accelerator, scheduler)
+            (a2, b2) = model.a.item(), model.b.item()
+            # Save a first time
+            accelerator.save_state()
+            train(1, model, train_dataloader, optimizer, accelerator, scheduler)
+            (a3, b3) = model.a.item(), model.b.item()
+
+            # Load back in the last saved checkpoint, should point to a2, b2
+            accelerator.load_state()
+            self.assertNotEqual(a3, model.a.item())
+            self.assertNotEqual(b3, model.b.item())
+            self.assertEqual(a2, model.a.item())
+            self.assertEqual(b2, model.b.item())
+
     def test_checkpoint_deletion(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             set_seed(42)
@@ -255,8 +284,7 @@ class CheckpointTest(unittest.TestCase):
 
     @require_cuda
     def test_map_location(self):
-        cmd = get_launch_prefix()
-        cmd += [f"--nproc_per_node={torch.cuda.device_count()}", inspect.getfile(self.__class__)]
+        cmd = ["torchrun", f"--nproc_per_node={torch.cuda.device_count()}", inspect.getfile(self.__class__)]
         execute_subprocess_async(cmd, env=os.environ.copy())
 
 

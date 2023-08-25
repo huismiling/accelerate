@@ -47,7 +47,7 @@ from .config_utils import (
 def get_cluster_input():
     distributed_type = _ask_options(
         "Which type of machine are you using?",
-        ["No distributed training", "multi-CPU", "multi-XPU", "multi-GPU", "TPU"],
+        ["No distributed training", "multi-CPU", "multi-XPU", "multi-GPU", "multi-NPU", "TPU"],
         _convert_distributed_mode,
     )
 
@@ -59,8 +59,14 @@ def get_cluster_input():
     main_process_port = None
     rdzv_backend = "static"
     same_network = True
+    debug = False
 
-    if distributed_type in [DistributedType.MULTI_GPU, DistributedType.MULTI_XPU, DistributedType.MULTI_CPU]:
+    if distributed_type in [
+        DistributedType.MULTI_GPU,
+        DistributedType.MULTI_NPU,
+        DistributedType.MULTI_XPU,
+        DistributedType.MULTI_CPU,
+    ]:
         num_machines = _ask_field(
             "How many different machines will you use (use more than 1 for multi-node training)? [1]: ",
             int,
@@ -89,6 +95,12 @@ def get_cluster_input():
                 rdzv_backend = _ask_field(
                     "What rendezvous backend will you use? ('static', 'c10d', ...): ", default="static"
                 )
+        debug = _ask_field(
+            "Should distributed operations be checked while running for errors? This can avoid timeout issues but will be slower. [yes/NO]: ",
+            _convert_yes_no_to_bool,
+            default=False,
+            error_message="Please enter yes or no.",
+        )
 
     if distributed_type == DistributedType.NO:
         use_cpu = _ask_field(
@@ -110,7 +122,11 @@ def get_cluster_input():
             default=False,
             error_message="Please enter yes or no.",
         )
-    if not use_cpu and is_xpu_available():
+    if (
+        not use_cpu
+        and is_xpu_available()
+        and distributed_type not in [DistributedType.MULTI_GPU, DistributedType.MULTI_NPU, DistributedType.TPU]
+    ):
         ipex_config["use_xpu"] = _ask_field(
             "Do you want to use XPU plugin to speed up training on XPU? [yes/NO]:",
             _convert_yes_no_to_bool,
@@ -296,7 +312,7 @@ def get_cluster_input():
                         )
 
     fsdp_config = {}
-    if distributed_type in [DistributedType.MULTI_GPU]:
+    if distributed_type in [DistributedType.MULTI_GPU, DistributedType.MULTI_NPU, DistributedType.MULTI_XPU]:
         use_fsdp = _ask_field(
             "Do you want to use FullyShardedDataParallel? [yes/NO]: ",
             _convert_yes_no_to_bool,
@@ -326,11 +342,18 @@ def get_cluster_input():
                 lambda x: FSDP_AUTO_WRAP_POLICY[int(x)],
             )
             if fsdp_config["fsdp_auto_wrap_policy"] == FSDP_AUTO_WRAP_POLICY[0]:
-                fsdp_config["fsdp_transformer_layer_cls_to_wrap"] = _ask_field(
-                    "Specify the comma-separated list of transformer layer class names (case-sensitive) to wrap ,e.g, :"
-                    "`BertLayer`, `GPTJBlock`, `T5Block`, `BertLayer,BertEmbeddings,BertSelfOutput` ...? : ",
-                    str,
+                use_no_split_modules = _ask_field(
+                    "Do you want to use the model's `_no_split_modules` to wrap. Only applicable for 🤗 Transformers [yes/NO]: ",
+                    _convert_yes_no_to_bool,
+                    default=False,
+                    error_message="Please enter yes or no.",
                 )
+                if not use_no_split_modules:
+                    fsdp_config["fsdp_transformer_layer_cls_to_wrap"] = _ask_field(
+                        "Specify the comma-separated list of transformer layer class names (case-sensitive) to wrap ,e.g, :"
+                        "`BertLayer`, `GPTJBlock`, `T5Block`, `BertLayer,BertEmbeddings,BertSelfOutput` ...? : ",
+                        str,
+                    )
             elif fsdp_config["fsdp_auto_wrap_policy"] == FSDP_AUTO_WRAP_POLICY[1]:
                 fsdp_config["fsdp_min_num_params"] = _ask_field(
                     "What should be your FSDP's minimum number of parameters for Default Auto Wrapping Policy? [1e8]: ",
@@ -363,9 +386,9 @@ def get_cluster_input():
                 error_message="Please enter yes or no.",
             )
             fsdp_config["fsdp_sync_module_states"] = _ask_field(
-                "Do you want each individually wrapped FSDP unit to broadcast module parameters from rank 0 at the start? [yes/NO]: ",
+                "Do you want each individually wrapped FSDP unit to broadcast module parameters from rank 0 at the start? [YES/no]: ",
                 _convert_yes_no_to_bool,
-                default=False,
+                default=True,
                 error_message="Please enter yes or no.",
             )
 
@@ -444,6 +467,7 @@ def get_cluster_input():
         DistributedType.MULTI_CPU,
         DistributedType.MULTI_XPU,
         DistributedType.MULTI_GPU,
+        DistributedType.MULTI_NPU,
         DistributedType.TPU,
     ]:
         machine_type = str(distributed_type).split(".")[1].replace("MULTI_", "")
@@ -467,8 +491,19 @@ def get_cluster_input():
     else:
         num_processes = 1
 
+    if (distributed_type == DistributedType.MULTI_GPU) and (num_machines == 1) and (num_processes == 1):
+        raise ValueError(
+            f"Specified distributed type {distributed_type} but only using 1 GPU on a single machine. Please select `No distributed training` for the type of machine you are using."
+        )
+
     if (
-        distributed_type in [DistributedType.MULTI_GPU, DistributedType.MULTI_XPU, DistributedType.NO]
+        distributed_type
+        in [
+            DistributedType.MULTI_GPU,
+            DistributedType.MULTI_NPU,
+            DistributedType.MULTI_XPU,
+            DistributedType.NO,
+        ]
         and not use_cpu
         and not use_mps
     ):
@@ -601,4 +636,5 @@ def get_cluster_input():
         tpu_use_sudo=tpu_use_sudo,
         tpu_use_cluster=tpu_use_cluster,
         dynamo_config=dynamo_config,
+        debug=debug,
     )

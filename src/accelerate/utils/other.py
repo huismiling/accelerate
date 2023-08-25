@@ -13,12 +13,15 @@
 # limitations under the License.
 
 import os
+import socket
 from contextlib import contextmanager
+from types import MethodType
 
 import torch
 
 from ..commands.config.default import write_basic_config  # noqa: F401
 from ..state import PartialState
+from .constants import FSDP_PYTORCH_VERSION
 from .dataclasses import DistributedType
 from .imports import is_deepspeed_available, is_tpu_available
 from .transformer_engine import convert_model
@@ -64,6 +67,11 @@ def extract_model_from_parallel(model, keep_fp32_wrapper: bool = True):
     if is_deepspeed_available():
         options += (DeepSpeedEngine,)
 
+    if is_torch_version(">=", FSDP_PYTORCH_VERSION):
+        from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
+
+        options += (FSDP,)
+
     while isinstance(model, options):
         model = model.module
 
@@ -75,7 +83,7 @@ def extract_model_from_parallel(model, keep_fp32_wrapper: bool = True):
                 forward = forward.__wrapped__
                 if forward == original_forward:
                     break
-            model.forward = forward
+            model.forward = MethodType(forward, model)
         if getattr(model, "_converted_to_transformer_engine", False):
             convert_model(model, to_transformer_engine=False)
 
@@ -111,6 +119,39 @@ def save(obj, f):
         xm.save(obj, f)
     elif PartialState().local_process_index == 0:
         torch.save(obj, f)
+
+
+@contextmanager
+def clear_environment():
+    """
+    A context manager that will cache origin `os.environ` and replace it with a empty dictionary in this context.
+
+    When this context exits, the cached `os.environ` will be back.
+
+    Example:
+
+    ```python
+    >>> import os
+    >>> from accelerate.utils import clear_environment
+
+    >>> os.environ["FOO"] = "bar"
+    >>> with clear_environment():
+    ...     print(os.environ)
+    ...     os.environ["FOO"] = "new_bar"
+    ...     print(os.environ["FOO"])
+    {}
+    new_bar
+
+    >>> print(os.environ["FOO"])
+    bar
+    ```
+    """
+    _old_os_environ = os.environ
+    os.environ = dict()
+
+    yield
+
+    os.environ = _old_os_environ
 
 
 @contextmanager
@@ -170,3 +211,24 @@ def merge_dicts(source, destination):
             destination[key] = value
 
     return destination
+
+
+def is_port_in_use(port: int = None) -> bool:
+    """
+    Checks if a port is in use on `localhost`. Useful for checking if multiple `accelerate launch` commands have been
+    run and need to see if the port is already in use.
+    """
+    if port is None:
+        port = 29500
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("localhost", port)) == 0
+
+
+def convert_bytes(size):
+    "Converts `size` from bytes to the largest possible unit"
+    for x in ["bytes", "KB", "MB", "GB", "TB"]:
+        if size < 1024.0:
+            return f"{round(size, 2)} {x}"
+        size /= 1024.0
+
+    return f"{round(size, 2)} PB"

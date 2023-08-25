@@ -14,7 +14,7 @@
 
 import math
 from contextlib import suppress
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 from torch.utils.data import BatchSampler, DataLoader, IterableDataset
@@ -52,12 +52,12 @@ _PYTORCH_DATALOADER_KWARGS = {
     "worker_init_fn": None,
     "multiprocessing_context": None,
     "generator": None,
+    "prefetch_factor": 2,
+    "persistent_workers": False,
 }
 
 # kwargs added after by version
-_PYTORCH_DATALOADER_ADDITIONAL_KWARGS = {
-    "1.7.0": {"prefetch_factor": 2, "persistent_workers": False},
-}
+_PYTORCH_DATALOADER_ADDITIONAL_KWARGS = {}
 
 for v, additional_kwargs in _PYTORCH_DATALOADER_ADDITIONAL_KWARGS.items():
     if is_torch_version(">=", v):
@@ -320,6 +320,18 @@ class DataLoaderStateMixin:
         self.end_of_dataloader = False
         self.remainder = -1
 
+    def begin(self):
+        "Prepares the gradient state for the current dataloader"
+        self.reset()
+        with suppress(Exception):
+            length = getattr(self.dataset, "total_dataset_length", len(self.dataset))
+            self.remainder = length % self.total_batch_size
+        self.gradient_state._add_dataloader(self)
+
+    def end(self):
+        "Cleans up the gradient state after exiting the dataloader"
+        self.gradient_state._remove_dataloader(self)
+
 
 class DataLoaderShard(DataLoader, DataLoaderStateMixin):
     """
@@ -365,12 +377,7 @@ class DataLoaderShard(DataLoader, DataLoaderStateMixin):
     def __iter__(self):
         if self.rng_types is not None:
             synchronize_rng_states(self.rng_types, self.synchronized_generator)
-        self.reset()
-        self.gradient_state._add_dataloader(self)
-        # We can safely pass because the default is -1
-        with suppress(Exception):
-            length = getattr(self.dataset, "total_dataset_length", len(self.dataset))
-            self.remainder = length % self.total_batch_size
+        self.begin()
         dataloader_iter = super().__iter__()
         # We iterate one batch ahead to check when we are at the end
         try:
@@ -394,7 +401,7 @@ class DataLoaderShard(DataLoader, DataLoaderStateMixin):
                 if batch_index >= self.skip_batches:
                     yield current_batch
                 break
-        self.gradient_state._remove_dataloader(self)
+        self.end()
 
     @property
     def total_batch_size(self):
@@ -478,7 +485,9 @@ class DataLoaderDispatcher(DataLoader, DataLoaderStateMixin):
         - **total_dataset_length** (`int`) -- Total length of the inner dataset across all processes.
     """
 
-    def __init__(self, dataset, split_batches: bool = False, skip_batches=0, _drop_last: bool = False, **kwargs):
+    def __init__(
+        self, dataset, split_batches: bool = False, skip_batches=0, _drop_last: bool = False, slice_fn=None, **kwargs
+    ):
         shuffle = False
         if is_torch_version(">=", "1.11.0"):
             from torch.utils.data.datapipes.iter.combinatorics import ShufflerIterDataPipe
@@ -488,10 +497,6 @@ class DataLoaderDispatcher(DataLoader, DataLoaderStateMixin):
                 shuffle = dataset._shuffle_enabled
         super().__init__(dataset, **kwargs)
         self.split_batches = split_batches
-        if is_torch_version("<", "1.8.0"):
-            raise ImportError(
-                f"Using `DataLoaderDispatcher` requires PyTorch 1.8.0 minimum. You have {torch.__version__}."
-            )
         if shuffle:
             torch.utils.data.graph_settings.apply_shuffle_settings(dataset, shuffle=shuffle)
 
@@ -499,10 +504,8 @@ class DataLoaderDispatcher(DataLoader, DataLoaderStateMixin):
         self.state = AcceleratorState()
         self._drop_last = _drop_last
         self.skip_batches = skip_batches
-        # We can safely pass because the default is -1
-        with suppress(Exception):
-            length = getattr(self.dataset, "total_dataset_length", len(self.dataset))
-            self.remainder = length % self.total_batch_size
+
+        self.slice_fn = slice_tensors if slice_fn is None else slice_fn
 
     def _fetch_batches(self, iterator):
         batches, batch = None, None
@@ -542,10 +545,14 @@ class DataLoaderDispatcher(DataLoader, DataLoaderStateMixin):
         return batch, batch_info
 
     def __iter__(self):
-        self.gradient_state._add_dataloader(self)
+        self.begin()
         main_iterator = None
-        if self.state.process_index == 0:
-            # We only iterate through the DataLoader on process 0.
+        if is_torch_version(">=", "2.0.1"):
+            # NOTE PyTorch DataLoader adds forward compatibilities for DataPipes, which broadcasts
+            # shared seed to all dist processes. Thus, we need to create iterator for all dist processes.
+            # But, we only iterate through the DataLoader on process 0.
+            main_iterator = super().__iter__()
+        elif self.state.process_index == 0:
             main_iterator = super().__iter__()
         stop_iteration = False
         self._stop_iteration = False
@@ -564,7 +571,12 @@ class DataLoaderDispatcher(DataLoader, DataLoaderStateMixin):
 
             if not self._drop_last and first_batch is None:
                 # We keep at least num processes elements of the first batch to be able to complete the last batch
-                first_batch = slice_tensors(batch, slice(0, self.state.num_processes))
+                first_batch = self.slice_fn(
+                    batch,
+                    slice(0, self.state.num_processes),
+                    process_index=self.state.process_index,
+                    num_processes=self.state.num_processes,
+                )
 
             if batch is None:
                 raise ValueError(
@@ -590,7 +602,12 @@ class DataLoaderDispatcher(DataLoader, DataLoaderStateMixin):
                 batch_size += 1
 
             data_slice = slice(self.state.process_index * batch_size, (self.state.process_index + 1) * batch_size)
-            batch = slice_tensors(batch, data_slice)
+            batch = self.slice_fn(
+                batch,
+                data_slice,
+                process_index=self.state.process_index,
+                num_processes=self.state.num_processes,
+            )
 
             if stop_iteration:
                 self.end_of_dataloader = True
@@ -598,7 +615,7 @@ class DataLoaderDispatcher(DataLoader, DataLoaderStateMixin):
             if batch_index >= self.skip_batches:
                 yield batch
             batch_index += 1
-        self.gradient_state._remove_dataloader(self)
+        self.end()
 
     def __len__(self):
         whole_length = super().__len__()
@@ -630,6 +647,7 @@ def prepare_data_loader(
     rng_types: Optional[List[Union[str, RNGType]]] = None,
     dispatch_batches: Optional[bool] = None,
     even_batches: bool = True,
+    slice_fn_for_dispatch: Optional[Callable] = None,
 ) -> DataLoader:
     """
     Wraps a PyTorch `DataLoader` to generate batches for one of the processes only.
@@ -679,6 +697,10 @@ def prepare_data_loader(
             If set to `True`, in cases where the total batch size across all processes does not exactly divide the
             dataset, samples at the start of the dataset will be duplicated so the batch can be divided equally among
             all workers.
+        slice_fn_for_dispatch (`Callable`, *optional*`):
+            If passed, this function will be used to slice tensors across `num_processes`. Will default to
+            [`~utils.slice_tensors`]. This argument is used only when `dispatch_batches` is set to `True` and will be
+            ignored otherwise.
 
     Returns:
         `torch.utils.data.dataloader.DataLoader`: A new data loader that will yield the portion of the batches
@@ -691,7 +713,7 @@ def prepare_data_loader(
     </Tip>
     """
     if dispatch_batches is None:
-        if is_torch_version("<", "1.8.0") or not put_on_device:
+        if not put_on_device:
             dispatch_batches = False
         else:
             dispatch_batches = isinstance(dataloader.dataset, IterableDataset)
@@ -783,6 +805,7 @@ def prepare_data_loader(
             split_batches=split_batches,
             batch_sampler=new_batch_sampler,
             _drop_last=dataloader.drop_last,
+            slice_fn=slice_fn_for_dispatch,
             **kwargs,
         )
     elif sampler_is_batch_sampler:

@@ -34,10 +34,13 @@ from accelerate.utils import (
     DistributedType,
     PrepareForLaunch,
     _filter_args,
+    is_bf16_available,
     is_deepspeed_available,
+    is_npu_available,
     is_rich_available,
     is_sagemaker_available,
     is_torch_version,
+    is_tpu_available,
     is_xpu_available,
     patch_environment,
     prepare_deepspeed_cmd_env,
@@ -523,7 +526,7 @@ def launch_command_parser(subparsers=None):
     )
     fsdp_args.add_argument(
         "--fsdp_sync_module_states",
-        default="false",
+        default="true",
         type=str,
         help="If True, each individually wrapped FSDP unit will broadcast module parameters from rank 0."
         " (useful only when `use_fsdp` flag is passed).",
@@ -628,13 +631,7 @@ def simple_launcher(args):
 
 
 def multi_gpu_launcher(args):
-    if is_torch_version(">=", "1.9.0"):
-        import torch.distributed.run as distrib_run
-    else:
-        raise NotImplementedError(
-            "Native multi-GPU training through `accelerate launch` requires pytorch>=1.9.1. "
-            "Please call `torch.distributed.launch` directly instead."
-        )
+    import torch.distributed.run as distrib_run
 
     current_env = prepare_multi_gpu_env(args)
 
@@ -657,8 +654,8 @@ def multi_gpu_launcher(args):
 
 
 def deepspeed_launcher(args):
-    if is_torch_version(">=", "1.9.0"):
-        import torch.distributed.run as distrib_run
+    import torch.distributed.run as distrib_run
+
     if not is_deepspeed_available():
         raise ImportError("DeepSpeed is not installed => run `pip3 install deepspeed` or build it from source.")
 
@@ -679,9 +676,6 @@ def deepspeed_launcher(args):
             else:
                 sys.exit(1)
     else:
-        if is_torch_version("<", "1.9.0"):
-            raise NotImplementedError("Multi-node training requires pytorch>=1.9.1")
-
         debug = getattr(args, "debug", False)
         args = _filter_args(
             args,
@@ -835,7 +829,10 @@ def _validate_launch_command(args):
         ):
             args.use_deepspeed = defaults.distributed_type == DistributedType.DEEPSPEED
             args.multi_gpu = (
-                True if defaults.distributed_type in (DistributedType.MULTI_GPU, DistributedType.MULTI_XPU) else False
+                True
+                if defaults.distributed_type
+                in (DistributedType.MULTI_GPU, DistributedType.MULTI_NPU, DistributedType.MULTI_XPU)
+                else False
             )
             args.tpu = defaults.distributed_type == DistributedType.TPU
             args.use_fsdp = defaults.distributed_type == DistributedType.FSDP
@@ -880,12 +877,24 @@ def _validate_launch_command(args):
                     and getattr(args, name, None) is None
                 ):
                     setattr(args, name, attr)
+        if not args.debug:
+            args.debug = defaults.debug
+
         if not args.mixed_precision:
             if defaults.mixed_precision is None:
                 args.mixed_precision = "no"
             else:
                 args.mixed_precision = defaults.mixed_precision
                 mp_from_config_flag = True
+        else:
+            native_amp = False
+            err = "{mode} mixed precision requires {requirement}"
+            if args.use_cpu or (args.use_xpu and torch.xpu.is_available()):
+                native_amp = is_torch_version(">=", "1.10")
+            else:
+                native_amp = is_bf16_available(True)
+            if args.mixed_precision == "bf16" and not native_amp and not (args.tpu and is_tpu_available()):
+                raise ValueError(err.format(mode="bf16", requirement="PyTorch >= 1.10 and a supported device."))
 
         # Silently set the default here
         if args.dynamo_backend is None:
@@ -894,11 +903,17 @@ def _validate_launch_command(args):
         if args.num_processes is None:
             if args.use_xpu and is_xpu_available():
                 args.num_processes = torch.xpu.device_count()
+            elif is_npu_available():
+                args.num_processes = torch.npu.device_count()
             else:
                 args.num_processes = torch.mlu.device_count()
             warned.append(f"\t`--num_processes` was set to a value of `{args.num_processes}`")
+        if args.debug is None:
+            args.debug = False
         if not args.multi_gpu and (
-            (args.use_xpu and is_xpu_available() and torch.xpu.device_count() > 1) or (torch.mlu.device_count() > 1)
+            (args.use_xpu and is_xpu_available() and torch.xpu.device_count() > 1)
+            or (is_npu_available() and torch.npu.device_count() > 1)
+            or (torch.mlu.device_count() > 1)
         ):
             warned.append(
                 "\t\tMore than one GPU was found, enabling multi-GPU training.\n"
@@ -916,6 +931,8 @@ def _validate_launch_command(args):
         if args.dynamo_backend is None:
             warned.append("\t`--dynamo_backend` was set to a value of `'no'`")
             args.dynamo_backend = "no"
+    if args.debug:
+        logger.debug("Running script in debug mode, expect distributed operations to be slightly slower.")
 
     is_aws_env_disabled = defaults is None or (
         defaults is not None and defaults.compute_environment != ComputeEnvironment.AMAZON_SAGEMAKER

@@ -22,24 +22,16 @@ import torch
 
 from ..commands.config.config_args import SageMakerConfig
 from ..commands.config.config_utils import DYNAMO_BACKENDS
-from ..utils import DynamoBackend, PrecisionType, is_ipex_available, is_torch_version, is_xpu_available
+from ..utils import (
+    DynamoBackend,
+    PrecisionType,
+    is_ipex_available,
+    is_npu_available,
+    is_xpu_available,
+)
 from ..utils.constants import DEEPSPEED_MULTINODE_LAUNCHERS
-from ..utils.other import merge_dicts
+from ..utils.other import is_port_in_use, merge_dicts
 from .dataclasses import DistributedType, SageMakerDistributedType
-
-
-def get_launch_prefix():
-    """
-    Grabs the correct launcher for starting a distributed command, such as either `torchrun`, `python -m
-    torch.distributed.run`, etc
-    """
-    if is_torch_version(">=", "1.10.0"):
-        cmd = ["torchrun"]
-    elif is_torch_version(">=", "1.9.0"):
-        cmd = [sys.executable, "-m", "torch.distributed.run"]
-    else:
-        cmd = [sys.executable, "-m", "torch.distributed.launch", "--use_env"]
-    return cmd
 
 
 def _filter_args(args, parser, default_args=[]):
@@ -83,11 +75,15 @@ def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> Tuple[List[str]
 
     current_env = os.environ.copy()
     current_env["ACCELERATE_USE_CPU"] = str(args.cpu or args.use_cpu)
+    if args.debug:
+        current_env["ACCELERATE_DEBUG_MODE"] = "true"
     if args.gpu_ids != "all" and args.gpu_ids is not None:
-        if not is_xpu_available():
-            current_env["CUDA_VISIBLE_DEVICES"] = args.gpu_ids
-        else:
+        if is_xpu_available():
             current_env["ZE_AFFINITY_MASK"] = args.gpu_ids
+        elif is_npu_available():
+            current_env["ASCEND_RT_VISIBLE_DEVICES"] = args.gpu_ids
+        else:
+            current_env["CUDA_VISIBLE_DEVICES"] = args.gpu_ids
     if args.num_machines > 1:
         current_env["MASTER_ADDR"] = args.main_process_ip
         current_env["MASTER_PORT"] = str(args.main_process_port)
@@ -142,6 +138,16 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> Dict[str, str]:
         if main_process_port is not None:
             setattr(args, "master_port", str(main_process_port))
 
+    if main_process_port is None:
+        main_process_port = 29500
+
+    if is_port_in_use(main_process_port):
+        raise ConnectionError(
+            f"Tried to launch distributed communication on port `{main_process_port}`, but another process is utilizing it. "
+            "Please specify a different port (such as using the `----main_process_port` flag or specifying a different `main_process_port` in your config file)"
+            " and rerun your script. To automatically use the next open port (on a single node), you can set this to `0`."
+        )
+
     if args.module and args.no_python:
         raise ValueError("--module and --no_python cannot be used together")
     elif args.module:
@@ -150,12 +156,16 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> Dict[str, str]:
         setattr(args, "no_python", True)
 
     current_env = os.environ.copy()
+    if args.debug:
+        current_env["ACCELERATE_DEBUG_MODE"] = "true"
     gpu_ids = getattr(args, "gpu_ids", "all")
     if gpu_ids != "all" and args.gpu_ids is not None:
-        if not is_xpu_available():
-            current_env["CUDA_VISIBLE_DEVICES"] = gpu_ids
-        else:
+        if is_xpu_available():
             current_env["ZE_AFFINITY_MASK"] = gpu_ids
+        elif is_npu_available():
+            current_env["ASCEND_RT_VISIBLE_DEVICES"] = gpu_ids
+        else:
+            current_env["CUDA_VISIBLE_DEVICES"] = gpu_ids
     mixed_precision = args.mixed_precision.lower()
     try:
         mixed_precision = PrecisionType(mixed_precision)
@@ -266,6 +276,16 @@ def prepare_deepspeed_cmd_env(args: argparse.Namespace) -> Tuple[List[str], Dict
         if main_process_port is not None:
             setattr(args, "master_port", str(main_process_port))
 
+    if main_process_port is None:
+        main_process_port = 29500
+
+    if is_port_in_use(main_process_port):
+        raise ConnectionError(
+            f"Tried to launch distributed communication on port `{main_process_port}`, but another process is utilizing it. "
+            "Please specify a different port (such as using the `----main_process_port` flag or specifying a different `main_process_port` in your config file)"
+            " and rerun your script. To automatically use the next open port (on a single node), you can set this to `0`."
+        )
+
     if args.module and args.no_python:
         raise ValueError("--module and --no_python cannot be used together")
     elif args.module:
@@ -274,6 +294,8 @@ def prepare_deepspeed_cmd_env(args: argparse.Namespace) -> Tuple[List[str], Dict
         setattr(args, "no_python", True)
 
     current_env = os.environ.copy()
+    if args.debug:
+        current_env["ACCELERATE_DEBUG_MODE"] = "true"
     gpu_ids = getattr(args, "gpu_ids", "all")
     if gpu_ids != "all" and args.gpu_ids is not None:
         if not is_xpu_available():
@@ -321,6 +343,8 @@ def prepare_tpu(
             current_env["XLA_DOWNCAST_BF16"] = "1"
         else:
             current_env["XLA_USE_BF16"] = "1"
+    if args.debug:
+        current_env["ACCELERATE_DEBUG_MODE"] = "true"
     if pod:
         # Take explicit args and set them up for XLA
         args.vm = args.tpu_vm
@@ -521,6 +545,7 @@ class PrepareForLaunch:
             )
         elif self.distributed_type in (
             DistributedType.MULTI_GPU,
+            DistributedType.MULTI_NPU,
             DistributedType.MULTI_XPU,
             DistributedType.MULTI_CPU,
         ):

@@ -1,5 +1,6 @@
 import json
 import os
+import pickle
 import tempfile
 from unittest.mock import patch
 
@@ -9,7 +10,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from accelerate import DistributedType, infer_auto_device_map, init_empty_weights
 from accelerate.accelerator import Accelerator
 from accelerate.state import GradientState, PartialState
-from accelerate.test_utils import require_multi_gpu, slow
+from accelerate.test_utils import require_bnb, require_multi_gpu, slow
 from accelerate.test_utils.testing import AccelerateTestCase, require_cuda
 from accelerate.utils import patch_environment
 
@@ -229,6 +230,7 @@ class AcceleratorTester(AccelerateTestCase):
         )
 
     @slow
+    @require_bnb
     def test_accelerator_bnb(self):
         """Tests that the accelerator can be used with the BNB library."""
         from transformers import AutoModelForCausalLM
@@ -244,6 +246,7 @@ class AcceleratorTester(AccelerateTestCase):
         model = accelerator.prepare(model)
 
     @slow
+    @require_bnb
     def test_accelerator_bnb_cpu_error(self):
         """Tests that the accelerator can be used with the BNB library. This should fail as we are trying to load a model
         that is loaded between cpu and gpu"""
@@ -268,6 +271,7 @@ class AcceleratorTester(AccelerateTestCase):
             model = accelerator.prepare(model)
 
     @slow
+    @require_bnb
     @require_multi_gpu
     def test_accelerator_bnb_multi_gpu(self):
         """Tests that the accelerator can be used with the BNB library."""
@@ -297,6 +301,7 @@ class AcceleratorTester(AccelerateTestCase):
         PartialState._reset_state()
 
     @slow
+    @require_bnb
     @require_multi_gpu
     def test_accelerator_bnb_multi_gpu_no_distributed(self):
         """Tests that the accelerator can be used with the BNB library."""
@@ -325,3 +330,35 @@ class AcceleratorTester(AccelerateTestCase):
         sgd = torch.optim.SGD(model.parameters(), lr=0.01)
         accelerator = Accelerator(cpu=True)
         _ = accelerator.prepare(sgd)
+
+    @require_cuda
+    def test_can_unwrap_model_fp16(self):
+        # test for a regression introduced in #872
+        # before the fix, after unwrapping with keep_fp32_wrapper=False, there would be the following error:
+        # Linear.forward() missing 1 required positional argument: 'input'
+        model = create_components()[0]
+        accelerator = Accelerator(mixed_precision="fp16")
+        inputs = torch.randn(10, 2).cuda()
+        model = accelerator.prepare(model)
+        model(inputs)  # sanity check that this works
+
+        model = accelerator.unwrap_model(model, keep_fp32_wrapper=False)
+        model(inputs)  # check that this still works
+
+        # check that pickle roundtrip works
+        model_loaded = pickle.loads(pickle.dumps(model))
+        model_loaded(inputs)
+
+    def test_can_unwrap_model(self):
+        model = create_components()[0]
+        accelerator = Accelerator(mixed_precision="no", cpu=True)
+        inputs = torch.randn(10, 2)
+        model = accelerator.prepare(model)
+        model(inputs)  # sanity check that this works
+
+        model = accelerator.unwrap_model(model, keep_fp32_wrapper=False)
+        model(inputs)  # check that this still works
+
+        # check that pickle roundtrip works
+        model_loaded = pickle.loads(pickle.dumps(model))
+        model_loaded(inputs)

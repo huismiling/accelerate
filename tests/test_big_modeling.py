@@ -30,8 +30,8 @@ from accelerate.big_modeling import (
     load_checkpoint_and_dispatch,
 )
 from accelerate.hooks import remove_hook_from_submodules
-from accelerate.test_utils import require_cuda, require_mps, require_multi_gpu, require_torch_min_version, slow
-from accelerate.utils import offload_state_dict
+from accelerate.test_utils import require_bnb, require_cuda, require_mps, require_multi_gpu, slow
+from accelerate.utils import is_torch_version, offload_state_dict
 
 
 class ModelForTest(nn.Module):
@@ -92,7 +92,6 @@ class ModelWithUnusedSubModulesForTest(nn.Module):
         return self.linear4(self.linear3(self.batchnorm(self.linear2(self.linear1(x)))))
 
 
-@require_torch_min_version(version="1.9.0")
 class BigModelingTester(unittest.TestCase):
     def test_init_empty_weights(self):
         # base use
@@ -107,8 +106,14 @@ class BigModelingTester(unittest.TestCase):
         self.assertEqual(module.running_mean.device, torch.device("cpu"))
 
         # Use with include_buffers=True
+        register_parameter_func = nn.Module.register_parameter
+        register_buffer_func = nn.Module.register_buffer
         with init_empty_weights(include_buffers=True):
             module = nn.BatchNorm1d(4)
+            # nn.Module.register_parameter/buffer shouldn't be changed with torch >= 2.0
+            if is_torch_version(">=", "2.0"):
+                self.assertEqual(register_parameter_func, nn.Module.register_parameter)
+                self.assertEqual(register_buffer_func, nn.Module.register_buffer)
         self.assertEqual(module.weight.device, torch.device("meta"))
         self.assertEqual(module.running_mean.device, torch.device("meta"))
 
@@ -319,6 +324,29 @@ class BigModelingTester(unittest.TestCase):
             dispatch_model(model, device_map, offload_dir=tmp_dir)
             output = model(x)
             self.assertTrue(torch.allclose(expected, output.cpu(), atol=1e-5))
+
+    @require_cuda
+    def test_dispatch_model_move_offloaded_model(self):
+        model = ModelForTest()
+        device_map = {"linear1": "disk", "batchnorm": "cpu", "linear2": 0}
+        with TemporaryDirectory() as tmp_dir:
+            dispatch_model(model, device_map, offload_dir=tmp_dir)
+            with self.assertRaises(RuntimeError):
+                model.to(0)
+
+    @require_multi_gpu
+    def test_dispatch_model_move_model_warning(self):
+        model = ModelForTest()
+        device_map = {"linear1": 0, "batchnorm": 0, "linear2": 1}
+        with TemporaryDirectory() as tmp_dir:
+            dispatch_model(model, device_map, offload_dir=tmp_dir)
+            with self.assertLogs("accelerate.big_modeling", level="WARNING"):
+                model.to("cpu")
+            with self.assertLogs("accelerate.big_modeling", level="WARNING"):
+                model.cuda(0)
+            with self.assertRaises(RuntimeError):
+                x = torch.randn(2, 3)
+                model(x)
 
     @slow
     @require_multi_gpu
@@ -599,6 +627,7 @@ class BigModelingTester(unittest.TestCase):
         self.assertEqual(model2.weight.device, torch.device("cpu"))
 
     @slow
+    @require_bnb
     @require_multi_gpu
     def test_dispatch_model_bnb(self):
         """Tests that `dispatch_model` quantizes int8 layers"""
@@ -635,6 +664,7 @@ class BigModelingTester(unittest.TestCase):
         self.assertTrue(model.h[-1].self_attention.query_key_value.weight.device.index == 1)
 
     @slow
+    @require_bnb
     def test_dispatch_model_int8_simple(self):
         """Tests that `dispatch_model` quantizes int8 layers"""
         from huggingface_hub import hf_hub_download
@@ -710,6 +740,7 @@ class BigModelingTester(unittest.TestCase):
         self.assertTrue(model.h[0].self_attention.query_key_value.weight.device.index == 0)
 
     @slow
+    @require_bnb
     @unittest.skip("Un-skip in the next transformers release")
     def test_dipatch_model_fp4_simple(self):
         """Tests that `dispatch_model` quantizes fp4 layers"""

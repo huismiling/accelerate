@@ -1,6 +1,8 @@
 from .testing import (
     are_the_same_tensors,
+    assert_exception,
     execute_subprocess_async,
+    require_bnb,
     require_cpu,
     require_cuda,
     require_huggingface_suite,

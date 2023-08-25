@@ -17,16 +17,15 @@ A set of basic tensor ops compatible with tpu, gpu, and multigpu
 """
 
 import pickle
-from functools import update_wrapper
+from functools import update_wrapper, wraps
 from typing import Any, Mapping
 
 import torch
 
 from ..state import PartialState
-from .constants import CUDA_DISTRIBUTED_TYPES
+from .constants import TORCH_DISTRIBUTED_OPERATION_TYPES
 from .dataclasses import DistributedType, TensorInformation
 from .imports import is_torch_distributed_available, is_tpu_available
-from .versions import is_torch_version
 
 
 if is_tpu_available(check_device=False):
@@ -190,6 +189,24 @@ def get_data_structure(data):
     return recursively_apply(_get_data_structure, data)
 
 
+def get_shape(data):
+    """
+    Recursively gathers the shape of a nested list/tuple/dictionary of tensors as a list.
+
+    Args:
+        data (nested list/tuple/dictionary of `torch.Tensor`):
+            The data to send to analyze.
+
+    Returns:
+        The same data structure as `data` with lists of tensor shapes instead of tensors.
+    """
+
+    def _get_shape(tensor):
+        return list(tensor.shape)
+
+    return recursively_apply(_get_shape, data)
+
+
 def initialize_tensors(data_structure):
     """
     Recursively initializes tensors from a nested list/tuple/dictionary of [`~utils.TensorInformation`].
@@ -252,6 +269,9 @@ def _tpu_gather(tensor):
         if tensor.ndim == 0:
             tensor = tensor.clone()[None]
 
+        # Can only gather contiguous tensors
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
         return xm.all_gather(tensor)
 
     res = recursively_apply(_tpu_gather_one, tensor, error_on_other_type=True)
@@ -263,6 +283,10 @@ def _gpu_gather(tensor):
     def _gpu_gather_one(tensor):
         if tensor.ndim == 0:
             tensor = tensor.clone()[None]
+
+        # Can only gather contiguous tensors
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
         output_tensors = [torch.empty_like(tensor) for _ in range(torch.distributed.get_world_size())]
         torch.distributed.all_gather(output_tensors, tensor)
         return torch.cat(output_tensors, dim=0)
@@ -270,9 +294,65 @@ def _gpu_gather(tensor):
     return recursively_apply(_gpu_gather_one, tensor, error_on_other_type=True)
 
 
-_cpu_gather = _gpu_gather
+class DistributedOperationException(Exception):
+    """
+    An exception class for distributed operations. Raised if the operation cannot be performed due to the shape of the
+    tensors.
+    """
+
+    pass
 
 
+def verify_operation(function):
+    """
+    Verifies that `tensor` is the same shape across all processes. Only ran if `PartialState().debug` is `True`.
+    """
+
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        if PartialState().distributed_type == DistributedType.NO or not PartialState().debug:
+            return function(*args, **kwargs)
+        operation = f"{function.__module__}.{function.__name__}"
+        if "tensor" in kwargs:
+            tensor = kwargs["tensor"]
+        else:
+            tensor = args[0]
+        shapes = get_shape(tensor)
+        output = gather_object([shapes])
+        if output[0] is not None:
+            are_same = output.count(output[0]) == len(output)
+            if not are_same:
+                process_shape_str = "\n  - ".join([f"Process {i}: {shape}" for i, shape in enumerate(output)])
+                raise DistributedOperationException(
+                    f"Cannot apply desired operation due to shape mismatches. "
+                    "All shapes across devices must be valid."
+                    f"\n\nOperation: `{operation}`\nInput shapes:\n  - {process_shape_str}"
+                )
+        return function(*args, **kwargs)
+
+    return wrapper
+
+
+def chained_operation(function):
+    """
+    Checks that `verify_operation` failed and if so reports a more helpful error chaining the existing
+    `DistributedOperationException`.
+    """
+
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except DistributedOperationException as e:
+            operation = f"{function.__module__}.{function.__name__}"
+            raise DistributedOperationException(
+                f"Error found while calling `{operation}`. Please see the earlier error for more details."
+            ) from e
+
+    return wrapper
+
+
+@verify_operation
 def gather(tensor):
     """
     Recursively gather tensor in a nested list/tuple/dictionary of tensors from all devices.
@@ -286,12 +366,8 @@ def gather(tensor):
     """
     if PartialState().distributed_type == DistributedType.TPU:
         return _tpu_gather(tensor)
-    elif PartialState().distributed_type in CUDA_DISTRIBUTED_TYPES:
+    elif PartialState().distributed_type in TORCH_DISTRIBUTED_OPERATION_TYPES:
         return _gpu_gather(tensor)
-    elif PartialState().distributed_type in DistributedType.MULTI_XPU:
-        return _gpu_gather(tensor)
-    elif PartialState().distributed_type == DistributedType.MULTI_CPU:
-        return _cpu_gather(tensor)
     else:
         return tensor
 
@@ -301,9 +377,6 @@ def _gpu_gather_object(object: Any):
     torch.distributed.all_gather_object(output_objects, object)
     # all_gather_object returns a list of lists, so we need to flatten it
     return [x for y in output_objects for x in y]
-
-
-_cpu_gather_object = _gpu_gather_object
 
 
 def gather_object(object: Any):
@@ -317,16 +390,10 @@ def gather_object(object: Any):
     Returns:
         The same data structure as `object` with all the objects sent to every device.
     """
-    if is_torch_version("<", "1.7"):
-        raise NotImplementedError("Gathering non-tensor objects requires PyTorch 1.7 or later")
     if PartialState().distributed_type == DistributedType.TPU:
         raise NotImplementedError("gather objects in TPU is not supported")
-    elif PartialState().distributed_type in CUDA_DISTRIBUTED_TYPES:
+    elif PartialState().distributed_type in TORCH_DISTRIBUTED_OPERATION_TYPES:
         return _gpu_gather_object(object)
-    elif PartialState().distributed_type in DistributedType.MULTI_XPU:
-        return _gpu_gather_object(object)
-    elif PartialState().distributed_type == DistributedType.MULTI_CPU:
-        return _cpu_gather_object(object)
     else:
         return object
 
@@ -347,6 +414,7 @@ def _tpu_broadcast(tensor, src=0, name="broadcast tensor"):
     return xm.mesh_reduce(name, tensor, lambda x: x[src])
 
 
+@verify_operation
 def broadcast(tensor, from_process: int = 0):
     """
     Recursively broadcast tensor in a nested list/tuple/dictionary of tensors to all devices.
@@ -362,11 +430,7 @@ def broadcast(tensor, from_process: int = 0):
     """
     if PartialState().distributed_type == DistributedType.TPU:
         return _tpu_broadcast(tensor, src=from_process, name="accelerate.utils.broadcast")
-    elif PartialState().distributed_type in CUDA_DISTRIBUTED_TYPES:
-        return _gpu_broadcast(tensor, src=from_process)
-    elif PartialState().distributed_type in DistributedType.MULTI_XPU:
-        return _gpu_broadcast(tensor, src=from_process)
-    elif PartialState().distributed_type == DistributedType.MULTI_CPU:
+    elif PartialState().distributed_type in TORCH_DISTRIBUTED_OPERATION_TYPES:
         return _gpu_broadcast(tensor, src=from_process)
     else:
         return tensor
@@ -388,16 +452,12 @@ def broadcast_object_list(object_list, from_process: int = 0):
     if PartialState().distributed_type == DistributedType.TPU:
         for i, obj in enumerate(object_list):
             object_list[i] = xm.mesh_reduce("accelerate.utils.broadcast_object_list", obj, lambda x: x[from_process])
-    elif PartialState().distributed_type in CUDA_DISTRIBUTED_TYPES:
-        torch.distributed.broadcast_object_list(object_list, src=from_process)
-    elif PartialState().distributed_type in DistributedType.MULTI_XPU:
-        torch.distributed.broadcast_object_list(object_list, src=from_process)
-    elif PartialState().distributed_type == DistributedType.MULTI_CPU:
+    elif PartialState().distributed_type in TORCH_DISTRIBUTED_OPERATION_TYPES:
         torch.distributed.broadcast_object_list(object_list, src=from_process)
     return object_list
 
 
-def slice_tensors(data, tensor_slice):
+def slice_tensors(data, tensor_slice, process_index=None, num_processes=None):
     """
     Recursively takes a slice in a nested list/tuple/dictionary of tensors.
 
@@ -439,6 +499,7 @@ def concatenate(data, dim=0):
     return torch.cat(data, dim=dim)
 
 
+@chained_operation
 def pad_across_processes(tensor, dim=0, pad_index=0, pad_first=False):
     """
     Recursively pad the tensors in a nested list/tuple/dictionary of tensors from all devices to the same size so they
@@ -485,6 +546,7 @@ def pad_across_processes(tensor, dim=0, pad_index=0, pad_first=False):
     )
 
 
+@verify_operation
 def reduce(tensor, reduction="mean"):
     """
     Recursively reduce the tensors in a nested list/tuple/dictionary of lists of tensors across all processes by the
@@ -507,11 +569,7 @@ def reduce(tensor, reduction="mean"):
             return cloned_tensor
         if state.distributed_type == DistributedType.TPU:
             xm.all_reduce("sum", cloned_tensor)
-        elif state.distributed_type.value in CUDA_DISTRIBUTED_TYPES:
-            torch.distributed.all_reduce(cloned_tensor, ReduceOp.SUM)
-        elif state.distributed_type.value in DistributedType.MULTI_XPU:
-            torch.distributed.all_reduce(cloned_tensor, ReduceOp.SUM)
-        elif state.distributed_type == DistributedType.MULTI_CPU:
+        elif state.distributed_type.value in TORCH_DISTRIBUTED_OPERATION_TYPES:
             torch.distributed.all_reduce(cloned_tensor, ReduceOp.SUM)
         if reduction == "mean":
             cloned_tensor /= state.num_processes
@@ -536,9 +594,7 @@ def convert_to_fp32(tensor):
         return tensor.float()
 
     def _is_fp16_bf16_tensor(tensor):
-        return hasattr(tensor, "dtype") and (
-            tensor.dtype == torch.float16 or (is_torch_version(">=", "1.10") and tensor.dtype == torch.bfloat16)
-        )
+        return hasattr(tensor, "dtype") and tensor.dtype in (torch.float16, torch.bfloat16)
 
     return recursively_apply(_convert_to_fp32, tensor, test_type=_is_fp16_bf16_tensor)
 

@@ -35,6 +35,7 @@ from .utils import (
     is_fp8_available,
     is_ipex_available,
     is_mps_available,
+    is_npu_available,
     is_tpu_available,
     is_xpu_available,
     parse_choice_from_env,
@@ -105,12 +106,13 @@ class PartialState:
           in use.
         - **local_process_index** (`int`) -- The index of the current process on the current server.
         - **mixed_precision** (`str`) -- Whether or not the current script will use mixed precision, and if so the type
-          of mixed precision being performed.
+          of mixed precision being performed. (Choose from 'no','fp16','bf16 or 'fp8').
         - **num_processes** (`int`) -- The number of processes currently launched in parallel.
         - **process_index** (`int`) -- The index of the current process.
         - **is_last_process** (`bool`) -- Whether or not the current process is the last one.
         - **is_main_process** (`bool`) -- Whether or not the current process is the main one.
         - **is_local_main_process** (`bool`) -- Whether or not the current process is the main one on the local node.
+        - **debug** (`bool`) -- Whether or not the current script is being run in debug mode.
     """
 
     _shared_state = SharedDict()
@@ -122,6 +124,7 @@ class PartialState:
             self.backend = None
             env_device = os.environ.get("ACCELERATE_TORCH_DEVICE", None)
             self.device = torch.device(env_device) if env_device is not None else None
+            self.debug = parse_flag_from_env("ACCELERATE_DEBUG_MODE")
             use_sagemaker_dp = kwargs.pop("_use_sagemaker_dp", None)
             if use_sagemaker_dp is None:
                 use_sagemaker_dp = (
@@ -195,6 +198,19 @@ class PartialState:
                 if self.device is None:
                     self.device = torch.device("mlu", self.local_process_index)
                 torch.mlu.set_device(self.device)
+            elif is_npu_available() and not cpu and int(os.environ.get("LOCAL_RANK", -1)) != -1:
+                self.distributed_type = DistributedType.MULTI_NPU
+                if not torch.distributed.is_initialized():
+                    # Backend is not set by the user, we set it here
+                    kwargs.pop("backend", None)
+                    self.backend = "hccl"
+                    torch.distributed.init_process_group(backend=self.backend, **kwargs)
+                self.num_processes = torch.distributed.get_world_size()
+                self.process_index = torch.distributed.get_rank()
+                self.local_process_index = int(os.environ.get("LOCAL_RANK", -1))
+                if self.device is None:
+                    self.device = torch.device("npu", self.local_process_index)
+                torch.npu.set_device(self.device)
             elif get_int_from_env(["PMI_SIZE", "OMPI_COMM_WORLD_SIZE", "MV2_COMM_WORLD_SIZE", "WORLD_SIZE"], 1) > 1:
                 if not cpu and is_xpu_available():
                     self.distributed_type = DistributedType.MULTI_XPU
@@ -343,6 +359,7 @@ class PartialState:
         """
         if self.distributed_type in (
             DistributedType.MULTI_GPU,
+            DistributedType.MULTI_NPU,
             DistributedType.MULTI_XPU,
             DistributedType.MULTI_CPU,
             DistributedType.DEEPSPEED,
@@ -403,23 +420,24 @@ class PartialState:
         if self.num_processes == 1:
             yield inputs
             return
+        length = len(inputs)
         # Nested dictionary of any types
         if isinstance(inputs, dict):
             length = len(inputs[list(inputs.keys())[0]])
             if not all(len(v) == length for v in inputs.values()):
                 raise ValueError("All values in the dictionary must have the same length")
-        num_samples_per_process = math.ceil(len(inputs) / self.num_processes)
+        num_samples_per_process = math.ceil(length / self.num_processes)
         start_index = self.process_index * num_samples_per_process
         end_index = start_index + num_samples_per_process
         if (len(inputs) % self.num_processes != 0) and (self.process_index == self.num_processes - 1):
-            if isinstance(inputs, (list, tuple, torch.Tensor)):
-                end_index = len(inputs)
-            elif isinstance(inputs, dict):
-                end_index = len(inputs[list(inputs.keys())[0]])
+            end_index = length
 
         def _split_values(inputs, start_index, end_index):
             if isinstance(inputs, (list, tuple, torch.Tensor)):
-                result = inputs[start_index:end_index]
+                if start_index >= len(inputs):
+                    result = inputs[-1:]
+                else:
+                    result = inputs[start_index:end_index]
                 if apply_padding:
                     if isinstance(result, torch.Tensor):
                         from accelerate.utils import pad_across_processes, send_to_device
@@ -649,6 +667,7 @@ class PartialState:
         Returns the default device which is:
         - MPS if `torch.backends.mps.is_available()` and `torch.backends.mps.is_built()` both return True.
         - CUDA if `torch.cuda.is_available()`
+        - NPU if `is_npu_available()`
         - CPU otherwise
         """
         if is_mps_available():
@@ -658,6 +677,8 @@ class PartialState:
             return torch.device("cuda")
         elif is_xpu_available():
             return torch.device("xpu:0")
+        elif is_npu_available():
+            return torch.device("npu")
         else:
             return torch.device("cpu")
 
@@ -674,12 +695,13 @@ class AcceleratorState:
         - **initialized** (`bool`) -- Whether or not the `AcceleratorState` has been initialized from `Accelerator`.
         - **local_process_index** (`int`) -- The index of the current process on the current server.
         - **mixed_precision** (`str`) -- Whether or not the current script will use mixed precision, and if so the type
-          of mixed precision being performed.
+          of mixed precision being performed. (Choose from 'no','fp16','bf16 or 'fp8').
         - **num_processes** (`int`) -- The number of processes currently launched in parallel.
         - **process_index** (`int`) -- The index of the current process.
         - **is_last_process** (`bool`) -- Whether or not the current process is the last one.
         - **is_main_process** (`bool`) -- Whether or not the current process is the main one.
         - **is_local_main_process** (`bool`) -- Whether or not the current process is the main one on the local node.
+        - **debug** (`bool`) -- Whether or not the current script is being run in debug mode.
     """
 
     _shared_state = SharedDict()
@@ -704,6 +726,7 @@ class AcceleratorState:
         self._check_initialized(mixed_precision, cpu)
         if not self.initialized:
             self.deepspeed_plugin = None
+            self.use_ipex = None
             mixed_precision = (
                 parse_choice_from_env("ACCELERATE_MIXED_PRECISION", "no")
                 if mixed_precision is None
@@ -741,12 +764,25 @@ class AcceleratorState:
                     self.distributed_type = DistributedType.MEGATRON_LM
                     megatron_lm_plugin.set_mixed_precision(self._mixed_precision)
                     self.megatron_lm_plugin = megatron_lm_plugin
+            elif self.distributed_type == DistributedType.MULTI_NPU:
+                if os.environ.get("ACCELERATE_USE_FSDP", "false") == "true":
+                    self.distributed_type = DistributedType.FSDP
+                    if self._mixed_precision != "no":
+                        fsdp_plugin.set_mixed_precision(self._mixed_precision)
+                    self.fsdp_plugin = fsdp_plugin
             elif self.distributed_type in [DistributedType.MULTI_CPU, DistributedType.MULTI_XPU, DistributedType.NO]:
                 if is_ipex_available():
                     "check if user disables it explicitly"
                     self.use_ipex = parse_flag_from_env("ACCELERATE_USE_IPEX", default=True)
                 else:
                     self.use_ipex = False
+                if self.distributed_type == DistributedType.MULTI_XPU:
+                    if os.environ.get("ACCELERATE_USE_FSDP", "false") == "true":
+                        self.distributed_type = DistributedType.FSDP
+                        if self._mixed_precision != "no":
+                            fsdp_plugin.set_mixed_precision(self._mixed_precision)
+                        self.fsdp_plugin = fsdp_plugin
+
             if (
                 self.dynamo_plugin.backend != DynamoBackend.NO
                 and self._mixed_precision == "no"
@@ -911,10 +947,12 @@ class GradientState:
         - **sync_gradients** (`bool`) -- Whether the gradients should be synced across all devices
         - **active_dataloader** (`Optional[DataLoader]`) -- The dataloader that is currently being iterated over
         - **dataloader_references** (`List[Optional[DataLoader]]`) -- A list of references to the dataloaders that are
-          being iterated over
+            being iterated over
         - **num_steps** (`int`) -- The number of steps to accumulate over
         - **adjust_scheduler** (`bool`) -- Whether the scheduler should be adjusted to account for the gradient
-          accumulation
+            accumulation
+        - **sync_with_dataloader** (`bool`) -- Whether the gradients should be synced at the end of the dataloader
+            iteration and the number of total steps reset
     """
 
     _shared_state = SharedDict()
@@ -942,6 +980,11 @@ class GradientState:
     def adjust_scheduler(self) -> bool:
         "Returns whether the scheduler should be adjusted"
         return self.plugin_kwargs.get("adjust_scheduler", False)
+
+    @property
+    def sync_with_dataloader(self) -> bool:
+        "Returns whether the gradients should be synced at the end of the dataloader iteration and the number of total steps reset"
+        return self.plugin_kwargs.get("sync_with_dataloader", True)
 
     @property
     def initialized(self) -> bool:

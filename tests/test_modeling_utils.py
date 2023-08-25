@@ -23,11 +23,11 @@ import torch.nn as nn
 
 from accelerate import init_empty_weights
 from accelerate.test_utils import require_cuda, require_huggingface_suite, require_multi_gpu, require_safetensors
-from accelerate.test_utils.testing import require_torch_min_version
 from accelerate.utils.modeling import (
     check_device_map,
     clean_device_map,
     compute_module_sizes,
+    convert_file_size_to_int,
     find_tied_parameters,
     get_balanced_memory,
     infer_auto_device_map,
@@ -55,7 +55,6 @@ def sequential_model(num_layers):
     return nn.Sequential(layers)
 
 
-@require_torch_min_version(version="1.9.0")
 class ModelingUtilsTester(unittest.TestCase):
     def check_set_module_tensor_for_device(self, model, device1, device2):
         self.assertEqual(model.linear1.weight.device, torch.device(device1))
@@ -139,6 +138,16 @@ class ModelingUtilsTester(unittest.TestCase):
         model = ModelForTest()
         set_module_tensor_to_device(model, "linear1.weight", "cpu", value=model.linear1.weight, dtype=torch.float16)
         self.assertEqual(model.linear1.weight.dtype, torch.float16)
+
+    def test_set_module_tensor_checks_shape(self):
+        model = ModelForTest()
+        tensor = torch.zeros((2, 2))
+        with self.assertRaises(ValueError) as cm:
+            set_module_tensor_to_device(model, "linear1.weight", "cpu", value=tensor)
+        self.assertEqual(
+            str(cm.exception),
+            'Trying to set a tensor of shape torch.Size([2, 2]) in "weight" (which has shape torch.Size([4, 3])), this look incorrect.',
+        )
 
     def test_named_tensors(self):
         model = nn.BatchNorm1d(4)
@@ -519,6 +528,10 @@ class ModelingUtilsTester(unittest.TestCase):
         max_memory = get_balanced_memory(model, max_memory={0: 200, 1: 200})
         self.assertDictEqual({0: 200, 1: 200}, max_memory)
 
+        # We should be able to set models on a non-contiguous sub-set of
+        max_memory = get_balanced_memory(model, max_memory={0: 200, 2: 200})
+        self.assertDictEqual({0: 200, 2: 200}, max_memory)
+
         max_memory = get_balanced_memory(model, max_memory={0: 300, 1: 300})
         self.assertDictEqual({0: 215, 1: 300}, max_memory)
 
@@ -552,3 +565,31 @@ class ModelingUtilsTester(unittest.TestCase):
             for param, device in device_map.items():
                 device = device if device != "disk" else "cpu"
                 self.assertEqual(loaded_state_dict[param].device, torch.device(device))
+
+    def test_convert_file_size(self):
+        result = convert_file_size_to_int("100MB")
+        self.assertEqual(result, 100 * (10**6))
+
+        result = convert_file_size_to_int("2GiB")
+        self.assertEqual(result, 2 * (2**30))
+
+        result = convert_file_size_to_int("512KiB")
+        self.assertEqual(result, 512 * (2**10))
+
+        result = convert_file_size_to_int("1.5GB")
+        self.assertEqual(result, 1.5 * (10**9))
+
+        result = convert_file_size_to_int("100KB")
+        self.assertEqual(result, 100 * (10**3))
+
+        result = convert_file_size_to_int(500)
+        self.assertEqual(result, 500)
+
+        with self.assertRaises(ValueError):
+            convert_file_size_to_int("5MBB")
+
+        with self.assertRaises(ValueError):
+            convert_file_size_to_int("5k0MB")
+
+        with self.assertRaises(ValueError):
+            convert_file_size_to_int("-1GB")
