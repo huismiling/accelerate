@@ -13,8 +13,8 @@
 # limitations under the License.
 
 import sys
+import importlib
 if sys.version_info < (3, 8):
-    import importlib
     import importlib_metadata
     importlib.metadata = importlib_metadata
 else:
