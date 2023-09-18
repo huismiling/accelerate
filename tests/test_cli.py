@@ -18,21 +18,17 @@ import unittest
 from pathlib import Path
 
 import torch
+from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
 
 import accelerate
 from accelerate.commands.estimate import estimate_command, estimate_command_parser, gather_data
 from accelerate.test_utils import execute_subprocess_async
 from accelerate.test_utils.testing import (
-    require_huggingface_hub,
     require_timm,
     require_transformers,
     run_command,
 )
-from accelerate.utils import is_huggingface_hub_available, patch_environment
-
-
-if is_huggingface_hub_available():
-    from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
+from accelerate.utils import patch_environment
 
 
 class AccelerateLauncherTester(unittest.TestCase):
@@ -71,10 +67,22 @@ class AccelerateLauncherTester(unittest.TestCase):
 
     def test_config_compatibility(self):
         for config in sorted(self.test_config_path.glob("**/*.yaml")):
-            with self.subTest(config_file=config):
-                execute_subprocess_async(
-                    self.base_cmd + ["--config_file", str(config), self.test_file_path], env=os.environ.copy()
-                )
+            if "invalid" not in str(config):
+                with self.subTest(config_file=config):
+                    execute_subprocess_async(
+                        self.base_cmd + ["--config_file", str(config), self.test_file_path], env=os.environ.copy()
+                    )
+
+    def test_invalid_keys(self):
+        with self.assertRaises(
+            RuntimeError,
+            msg="The config file at 'invalid_keys.yaml' had unknown keys ('another_invalid_key', 'invalid_key')",
+        ):
+            execute_subprocess_async(
+                self.base_cmd
+                + ["--config_file", str(self.test_config_path / "invalid_keys.yaml"), self.test_file_path],
+                env=os.environ.copy(),
+            )
 
     def test_accelerate_test(self):
         execute_subprocess_async(["accelerate", "test"], env=os.environ.copy())
@@ -224,7 +232,6 @@ class TpuConfigTester(unittest.TestCase):
         )
 
 
-@require_huggingface_hub
 class ModelEstimatorTester(unittest.TestCase):
     """
     Test case for checking the output of `accelerate estimate-memory` is correct.

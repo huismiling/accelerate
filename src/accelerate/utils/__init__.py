@@ -35,7 +35,7 @@ from .dataclasses import (
     TensorInformation,
     TorchDynamoPlugin,
 )
-from .environment import get_int_from_env, parse_choice_from_env, parse_flag_from_env
+from .environment import get_int_from_env, parse_choice_from_env, parse_flag_from_env, str_to_bool
 from .imports import (
     get_ccl_version,
     is_4bit_bnb_available,
@@ -50,7 +50,6 @@ from .imports import (
     is_datasets_available,
     is_deepspeed_available,
     is_fp8_available,
-    is_huggingface_hub_available,
     is_ipex_available,
     is_megatron_lm_available,
     is_mlflow_available,

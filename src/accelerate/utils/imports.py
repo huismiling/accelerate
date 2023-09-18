@@ -23,14 +23,13 @@ else:
 
 import os
 import warnings
-from distutils.util import strtobool
 from functools import lru_cache
 
 import torch
 from packaging import version
 from packaging.version import parse
 
-from .environment import parse_flag_from_env
+from .environment import parse_flag_from_env, str_to_bool
 from .versions import compare_versions, is_torch_version
 
 
@@ -134,6 +133,8 @@ def is_bf16_available(ignore_tpu=False):
         return torch.mlu.is_bf16_supported()
     if is_npu_available():
         return False
+    if torch.cuda.is_available():
+        return torch.cuda.is_bf16_supported()
     return True
 
 
@@ -158,7 +159,7 @@ def is_bnb_available():
 
 
 def is_megatron_lm_available():
-    if strtobool(os.environ.get("ACCELERATE_USE_MEGATRON_LM", "False")) == 1:
+    if str_to_bool(os.environ.get("ACCELERATE_USE_MEGATRON_LM", "False")) == 1:
         package_exists = importlib.util.find_spec("megatron") is not None
         if package_exists:
             try:
@@ -179,10 +180,6 @@ def is_transformers_available():
 
 def is_datasets_available():
     return _is_package_available("datasets")
-
-
-def is_huggingface_hub_available():
-    return _is_package_available("huggingface_hub")
 
 
 def is_timm_available():
@@ -233,7 +230,16 @@ def is_tqdm_available():
 
 
 def is_mlflow_available():
-    return _is_package_available("mlflow")
+    if _is_package_available("mlflow"):
+        return True
+
+    if importlib.util.find_spec("mlflow") is not None:
+        try:
+            _ = importlib.metadata.metadata("mlflow-skinny")
+            return True
+        except importlib.metadata.PackageNotFoundError:
+            return False
+    return False
 
 
 def is_mps_available():

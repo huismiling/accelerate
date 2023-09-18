@@ -35,6 +35,10 @@ from .offload import load_offloaded_weight, offload_weight, save_offload_index
 from .tqdm import is_tqdm_available, tqdm
 
 
+if is_npu_available(check_device=False):
+    import torch_npu  # noqa: F401
+
+
 if is_safetensors_available():
     from safetensors import safe_open
     from safetensors.torch import load_file as safe_load_file
@@ -774,9 +778,6 @@ def get_balanced_memory(
     user_not_set_max_memory = max_memory is None
     max_memory = get_max_memory(max_memory)
 
-    if not (torch.mlu.is_available() or is_xpu_available()) or is_mps_available():
-        return max_memory
-
     if not is_xpu_available():
         num_devices = len([d for d in max_memory if torch.device(d).type == "mlu" and max_memory[d] > 0])
     else:
@@ -791,6 +792,9 @@ def get_balanced_memory(
                 and max_memory[d] > 0
             ]
         )
+
+    if num_devices == 0:
+        return max_memory
 
     if num_devices == 1:
         # We cannot do low_zero on just one GPU, but we will still reserve some memory for the buffer
@@ -1455,14 +1459,12 @@ def get_mixed_precision_context_manager(native_amp: bool = False, autocast_kwarg
         autocast_kwargs = autocast_kwargs.to_kwargs()
     if native_amp:
         if state.mixed_precision == "fp16":
-            if is_npu_available():
-                return torch.npu.amp.autocast(dtype=torch.float16, **autocast_kwargs)
-            else:
-                return torch.autocast(device_type=state.device.type, dtype=torch.float16, **autocast_kwargs)
+            return torch.autocast(device_type=state.device.type, dtype=torch.float16, **autocast_kwargs)
         elif state.mixed_precision == "bf16" and state.distributed_type in [
             DistributedType.NO,
             DistributedType.MULTI_CPU,
             DistributedType.MULTI_GPU,
+            DistributedType.MULTI_NPU,
             DistributedType.MULTI_XPU,
         ]:
             return torch.autocast(device_type=state.device.type, dtype=torch.bfloat16, **autocast_kwargs)

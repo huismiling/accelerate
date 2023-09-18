@@ -48,6 +48,10 @@ if is_tpu_available(check_device=False):
     import torch_xla.core.xla_model as xm
 
 
+if is_npu_available(check_device=False):
+    import torch_npu  # noqa: F401
+
+
 def is_initialized() -> bool:
     """
     Checks if the `AcceleratorState` has been initialized from `Accelerator`. Same as `AcceleratorState.initialized`,
@@ -168,7 +172,11 @@ class PartialState:
 
                     # DeepSpeed always uses nccl
                     kwargs.pop("backend", None)
-                    self.backend = "cncl"
+                    if is_xpu_available and is_ccl_available():
+                        # Set DeepSpeed backend to ccl for xpu
+                        self.backend = "ccl"
+                    else:
+                        self.backend = "cncl"
                     dist.init_distributed(dist_backend=self.backend, auto_mpi_discovery=False, **kwargs)
 
                 self.num_processes = torch.distributed.get_world_size()

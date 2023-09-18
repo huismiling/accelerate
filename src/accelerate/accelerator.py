@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import functools
 import json
 import math
 import os
@@ -68,6 +69,7 @@ from .utils import (
     convert_outputs_to_fp32,
     extract_model_from_parallel,
     gather,
+    gather_object,
     get_mixed_precision_context_manager,
     get_pretty_name,
     has_transformer_engine_layers,
@@ -96,11 +98,10 @@ from .utils import (
     wait_for_everyone,
 )
 from .utils.constants import FSDP_PYTORCH_VERSION
+from .utils.other import is_compiled_module
 
 
 if is_deepspeed_available():
-    import deepspeed
-
     from .utils import (
         DeepSpeedEngineWrapper,
         DeepSpeedOptimizerWrapper,
@@ -135,6 +136,10 @@ if is_megatron_lm_available():
 if is_tpu_available(check_device=False):
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.xla_multiprocessing as xmp
+
+
+if is_npu_available(check_device=False):
+    import torch_npu  # noqa: F401
 
 
 try:
@@ -418,11 +423,10 @@ class Accelerator:
         if (
             self.state.mixed_precision == "fp16"
             and self.device.type != "cpu"
-            and self.device.type != "xpu"
             and self.distributed_type not in (DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM)
         ):
             self.native_amp = True
-            if self.device.type not in ("cuda", "mlu", "mps", "npu"):
+            if self.device.type not in ("xpu", "cuda", "mps", "npu", "mlu",):
                 raise ValueError(err.format(mode="fp16", requirement="a GPU"))
             kwargs = self.scaler_handler.to_kwargs() if self.scaler_handler is not None else {}
             if self.distributed_type == DistributedType.FSDP:
@@ -463,6 +467,9 @@ class Accelerator:
         self.rng_types = rng_types
         if self.rng_types is None:
             self.rng_types = ["generator"]
+
+        # Set a flag tensor for early stopping and other breakpoints
+        self.flag_tensor = None
 
     @property
     def use_distributed(self):
@@ -1216,7 +1223,12 @@ class Accelerator:
             for obj in args:
                 if isinstance(obj, torch.nn.Module):
                     model_count += 1
-                    is_type_fsdp = type(obj) == FSDP
+                    # if the model is compiled using PyTorch 2.0,
+                    # check that the wrapped model is FSDP or not;
+                    # else check if it is FSDP or not;
+                    is_type_fsdp = isinstance(obj, FSDP) or (
+                        is_compiled_module(obj) and isinstance(obj._orig_mod, FSDP)
+                    )
                 if isinstance(obj, torch.optim.Optimizer):
                     optimizer_present = True
             if model_count > 1 and optimizer_present:
@@ -1372,7 +1384,7 @@ class Accelerator:
         elif device_placement and not self.verify_device_map(model):
             model = model.to(self.device)
 
-        if self.native_amp and self.distributed_type != DistributedType.FSDP:
+        if self.native_amp:
             model._original_forward = model.forward
             model_forward_func = model.forward.__func__ if hasattr(model.forward, "__func__") else model.forward
             autocast_context = get_mixed_precision_context_manager(self.native_amp, self.autocast_handler)
@@ -1424,7 +1436,13 @@ class Accelerator:
 
                 # Check if the model is already a FSDP model due to `Manual Wrapping` and if so,
                 # don't wrap it again
-                if type(model) != FSDP:
+                # In case the model is already compiled using PyTorch 2.0 and the wrapped model in it
+                # is a FSDP model, don't wrap it again
+                is_type_fsdp = isinstance(model, FSDP) or (
+                    is_compiled_module(model) and isinstance(model._orig_mod, FSDP)
+                )
+
+                if not is_type_fsdp:
                     self.state.fsdp_plugin.set_auto_wrap_policy(model)
                     fsdp_plugin = self.state.fsdp_plugin
                     kwargs = {
@@ -1442,20 +1460,40 @@ class Accelerator:
                         "device_id": self.device,
                     }
                     model = FSDP(model, **kwargs)
+                    if fsdp_plugin.activation_checkpointing:
+                        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                            CheckpointImpl,
+                            apply_activation_checkpointing,
+                            checkpoint_wrapper,
+                        )
+
+                        apply_activation_checkpointing(
+                            model,
+                            checkpoint_wrapper_fn=functools.partial(
+                                checkpoint_wrapper,
+                                checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                            ),
+                            auto_wrap_policy=fsdp_plugin.auto_wrap_policy,
+                        )
+                # if the previous and current models are same, delete the previous one
+                if len(self._models) > 1 and (self._models[-2] is self._models[-1]):
+                    del self._models[-2]
                 self._models[-1] = model
             elif self.distributed_type == DistributedType.MULTI_CPU:
                 kwargs = self.ddp_handler.to_kwargs() if self.ddp_handler is not None else {}
                 model = torch.nn.parallel.DistributedDataParallel(model, **kwargs)
             elif self.distributed_type == DistributedType.TPU and self.state.fork_launched:
                 model = xmp.MpModelWrapper(model).to(self.device)
-        # torch.compile should be called last.
-        if self.state.dynamo_plugin.backend != DynamoBackend.NO:
+        # torch.compile should be called last and only if the model isn't already compiled.
+        if self.state.dynamo_plugin.backend != DynamoBackend.NO and not is_compiled_module(model):
             if not is_torch_version(">=", "2.0"):
                 raise ValueError("Using `torch.compile` requires PyTorch 2.0 or higher.")
             model = torch.compile(model, **self.state.dynamo_plugin.to_kwargs())
         return model
 
     def _prepare_deepspeed(self, *args):
+        import deepspeed
+
         deepspeed_plugin = self.state.deepspeed_plugin
 
         is_dataloader_present = any(isinstance(obj, torch.utils.data.DataLoader) for obj in args)
@@ -1492,12 +1530,13 @@ class Accelerator:
             batch_size_per_device = deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"]
             result = [obj for obj in args]
 
-        if self.gradient_accumulation_steps != deepspeed_plugin.deepspeed_config["gradient_accumulation_steps"]:
-            logger.info(
-                f"Updating DeepSpeed's gradient accumulation steps to {self.gradient_accumulation_steps} from "
-                f"{deepspeed_plugin.deepspeed_config['gradient_accumulation_steps']}."
-            )
-            deepspeed_plugin.deepspeed_config["gradient_accumulation_steps"] = self.gradient_accumulation_steps
+        # handle `gradient_accumulation_steps` when the value is `auto`
+        deepspeed_plugin.fill_match(
+            "gradient_accumulation_steps",
+            must_match=False,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+        )
+
         config_kwargs = {
             "train_micro_batch_size_per_gpu": batch_size_per_device,
             "train_batch_size": batch_size_per_device
@@ -1542,9 +1581,14 @@ class Accelerator:
                     "Please remove the scheduler from the config file or "
                     "create `accelerate.utils.DummyScheduler` in the code."
                 )
-            elif "scheduler" not in deepspeed_plugin.deepspeed_config and isinstance(scheduler, (DummyScheduler)):
+            elif (
+                "scheduler" not in deepspeed_plugin.deepspeed_config
+                and isinstance(scheduler, (DummyScheduler))
+                and scheduler.lr_scheduler_callable is None
+            ):
                 raise ValueError(
-                    "You cannot create a `DummyScheduler` without specifying a scheduler in the config file."
+                    "Either specify a scheduler in the config file or "
+                    "pass in the `lr_scheduler_callable` parameter when using `accelerate.utils.DummyScheduler`."
                 )
 
         if optimizer is not None and scheduler is not None:
@@ -1574,7 +1618,7 @@ class Accelerator:
                 config_kwargs.update(
                     {"optimizer.params.lr": optimizer.lr, "optimizer.params.weight_decay": optimizer.weight_decay}
                 )
-            if isinstance(scheduler, (DummyScheduler)):
+            if isinstance(scheduler, (DummyScheduler)) and scheduler.lr_scheduler_callable is None:
                 max_lr = (
                     getattr(scheduler.optimizer, "lr", None)
                     if getattr(scheduler.optimizer, "defaults", None) is None
@@ -1599,6 +1643,8 @@ class Accelerator:
             if optimizer is not None:
                 if isinstance(optimizer, (DummyOptim)):
                     kwargs["model_parameters"] = optimizer.params
+                    if isinstance(scheduler, (DummyScheduler)) and scheduler.lr_scheduler_callable is not None:
+                        kwargs["lr_scheduler"] = scheduler.lr_scheduler_callable
                 else:
                     # cndsp 0.7.1 not support cuda kernel
                     if self.deepspeed_config["zero_optimization"].get("offload_optimizer", {}).get(
@@ -1610,7 +1656,10 @@ class Accelerator:
                         optimizer = DeepSpeedCPUAdam(optimizer.param_groups, **defaults)
                     kwargs["optimizer"] = optimizer
                     if scheduler is not None:
-                        if type(scheduler).__name__ in deepspeed.runtime.lr_schedules.VALID_LR_SCHEDULES:
+                        if (
+                            isinstance(scheduler, LRScheduler)
+                            or type(scheduler).__name__ in deepspeed.runtime.lr_schedules.VALID_LR_SCHEDULES
+                        ):
                             kwargs["lr_scheduler"] = scheduler
 
             engine, optimizer, _, lr_scheduler = deepspeed.initialize(**kwargs)
@@ -1938,6 +1987,65 @@ class Accelerator:
         else:
             loss.backward(**kwargs)
 
+    def set_trigger(self):
+        """
+        Sets the internal trigger tensor to 1 on the current process. A latter check should follow using this which
+        will check across all processes.
+
+        Note:
+            Does not require `wait_for_everyone()`
+
+        Example:
+
+        ```python
+        >>> from accelerate import Accelerator
+
+        >>> accelerator = Accelerator()
+        >>> # Assume later in the training script
+        >>> # `should_do_breakpoint` is a custom function to monitor when to break,
+        >>> # e.g. when the loss is NaN
+        >>> if should_do_breakpoint(loss):
+        ...     accelerator.set_trigger()
+        >>> # Assume later in the training script
+        >>> if accelerator.check_breakpoint():
+        ...     break
+        ```
+        """
+        self.flag_tensor = torch.tensor(1, device=self.device)
+
+    def check_trigger(self):
+        """
+        Checks if the internal trigger tensor has been set to 1 in any of the processes. If so, will return `True` and
+        reset the trigger tensor to 0.
+
+        Note:
+            Does not require `wait_for_everyone()`
+
+        Example:
+
+        ```python
+        >>> from accelerate import Accelerator
+
+        >>> accelerator = Accelerator()
+        >>> # Assume later in the training script
+        >>> # `should_do_breakpoint` is a custom function to monitor when to break,
+        >>> # e.g. when the loss is NaN
+        >>> if should_do_breakpoint(loss):
+        ...     accelerator.set_trigger()
+        >>> # Assume later in the training script
+        >>> if accelerator.check_trigger():
+        ...     break
+        ```
+        """
+        # Now that we are outside `__init__`, we can initialize it if it is `None` on device
+        if self.flag_tensor is None:
+            self.flag_tensor = torch.tensor(0, device=self.device)
+        flag_tensor = self.reduce(self.flag_tensor)
+        if flag_tensor.item() >= 1:
+            self.flag_tensor = torch.tensor(0, device=self.device)
+            return True
+        return False
+
     def unscale_gradients(self, optimizer=None):
         """
         Unscale the gradients in mixed precision training with AMP. This is a noop in all other settings.
@@ -1971,6 +2079,10 @@ class Accelerator:
             for opt in optimizer:
                 while isinstance(opt, AcceleratedOptimizer):
                     opt = opt.optimizer
+                # Reduce gradients first for XLA
+                if self.distributed_type == DistributedType.TPU:
+                    gradients = xm._fetch_gradients(opt)
+                    self.reduce(gradients, scale=1.0 / self.num_processes)
                 self.scaler.unscale_(opt)
 
     def clip_grad_norm_(self, parameters, max_norm, norm_type=2):
@@ -2070,14 +2182,14 @@ class Accelerator:
         """
         return gather(tensor)
 
-    def gather_for_metrics(self, tensor):
+    def gather_for_metrics(self, input_data):
         """
-        Gathers `tensor` and potentially drops duplicates in the last batch if on a distributed system. Should be used
-        for gathering the inputs and targets for metric calculation.
+        Gathers `input_data` and potentially drops duplicates in the last batch if on a distributed system. Should be
+        used for gathering the inputs and targets for metric calculation.
 
         Args:
-            tensor (`torch.Tensor`, or a nested tuple/list/dictionary of `torch.Tensor`):
-                The tensors for calculating metrics across all processes.
+            input (`torch.Tensor`, `object`, a nested tuple/list/dictionary of `torch.Tensor`, or a nested tuple/list/dictionary of `object`):
+                The tensors or objects for calculating metrics across all processes
 
         Example:
 
@@ -2095,7 +2207,17 @@ class Accelerator:
         9
         ```
         """
-        tensor = self.gather(tensor)
+
+        try:
+            recursively_apply(lambda x: x, input_data, error_on_other_type=True)
+            all_tensors = True
+        except TypeError:
+            all_tensors = False
+
+        if not all_tensors:
+            data = gather_object(input_data)
+        else:
+            data = self.gather(input_data)
 
         try:
             if self.gradient_state.end_of_dataloader:
@@ -2105,24 +2227,24 @@ class Accelerator:
                     logger.info(
                         "The used dataset had no length, returning gathered tensors. You should drop the remainder yourself."
                     )
-                    return tensor
+                    return data
                 elif self.gradient_state.remainder > 0:
                     # Last batch needs to be truncated on distributed systems as it contains additional samples
                     def _adjust_samples(tensor):
                         return tensor[: self.gradient_state.remainder]
 
-                    return recursively_apply(_adjust_samples, tensor)
+                    return recursively_apply(_adjust_samples, data)
                 else:  # remainder is 0
                     # no remainder even though at end of dataloader, so nothing to do.
-                    return tensor
+                    return data
             else:
                 # Not at the end of the dataloader, no need to adjust the tensors
-                return tensor
+                return data
         except Exception:
             # Dataset had no length or raised an error
-            return tensor
+            return data
 
-    def reduce(self, tensor, reduction="sum"):
+    def reduce(self, tensor, reduction="sum", scale=1.0):
         """
         Reduce the values in *tensor* across all processes based on *reduction*.
 
@@ -2134,6 +2256,8 @@ class Accelerator:
                 The tensors to reduce across all processes.
             reduction (`str`, *optional*, defaults to "sum"):
                 A reduction type, can be one of 'sum', 'mean', or 'none'. If 'none', will not perform any operation.
+            scale (`float`, *optional*, defaults to 1.0):
+                A default scaling value to be applied after the reduce, only valied on XLA.
 
         Returns:
             `torch.Tensor`, or a nested tuple/list/dictionary of `torch.Tensor`:
@@ -2154,7 +2278,7 @@ class Accelerator:
         tensor([4, 6])
         ```
         """
-        return reduce(tensor, reduction)
+        return reduce(tensor, reduction, scale)
 
     def pad_across_processes(self, tensor, dim=0, pad_index=0, pad_first=False):
         """
@@ -2378,13 +2502,14 @@ class Accelerator:
         for tracker in self.trackers:
             tracker.finish()
 
-    def save(self, obj, f):
+    def save(self, obj, f, safe_serialization=False):
         """
         Save the object passed to disk once per machine. Use in place of `torch.save`.
 
         Args:
             obj (`object`): The object to save.
             f (`str` or `os.PathLike`): Where to save the content of `obj`.
+            safe_serialization (`bool`, *optional*, defaults to `False`): Whether to save `obj` using `safetensors`
 
         Example:
 
@@ -2396,7 +2521,7 @@ class Accelerator:
         >>> accelerator.save(arr, "array.pkl")
         ```
         """
-        save(obj, f)
+        save(obj, f, safe_serialization=safe_serialization)
 
     def save_model(
         self,
@@ -2476,7 +2601,7 @@ class Accelerator:
                             del state_dict[name]
                             warn_names.add(name)
             if len(warn_names) > 0:
-                logger.warning_once(
+                logger.warning(
                     f"Removed shared tensor {warn_names} while saving. This should be OK, but check by verifying that you don't receive any warning while reloading",
                 )
 
@@ -2507,7 +2632,7 @@ class Accelerator:
 
         # Save the model
         for shard_file, shard in shards.items():
-            self.save(shard, os.path.join(save_directory, shard_file))
+            self.save(shard, os.path.join(save_directory, shard_file), safe_serialization=safe_serialization)
 
         if index is None:
             path_to_weights = os.path.join(save_directory, WEIGHTS_NAME)
@@ -2598,8 +2723,10 @@ class Accelerator:
         os.makedirs(output_dir, exist_ok=True)
         if self.project_configuration.automatic_checkpoint_naming:
             folders = [os.path.join(output_dir, folder) for folder in os.listdir(output_dir)]
-            if self.project_configuration.total_limit is not None and (
-                len(folders) + 1 > self.project_configuration.total_limit
+            if (
+                self.project_configuration.total_limit is not None
+                and (len(folders) + 1 > self.project_configuration.total_limit)
+                and self.is_main_process
             ):
 
                 def _inner(folder):
